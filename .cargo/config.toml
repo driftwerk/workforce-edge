@@ -1,0 +1,10 @@
+[net]
+# Fetch git dependencies with the git CLI.
+git-fetch-with-cli = true
+
+# To build against a local core checkout instead of the pinned revision, add
+# (outside version control, e.g. in ~/.cargo/config.toml or here, uncommitted):
+#
+# [patch."https://github.com/driftwerk/workforce"]
+# workforce-common = { path = "../workforce/crates/common" }
+# ... one line per core crate listed in Cargo.toml.

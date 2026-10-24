@@ -1,0 +1,96 @@
+# Example configuration for the standalone `workforce-edge` service.
+#
+# The edge is deployed on its own, with its own Postgres and its own Weaviate,
+# isolated from the internal hub. Point the binary at this file:
+#
+#     workforce-edge /etc/workforce-edge/edge.toml
+#
+# or set WORKFORCE_EDGE_CONFIG. Secrets should come from the environment in
+# production (e.g. `url = "${EDGE_PG_URL}"` is NOT expanded here — inject the
+# real value via your secrets manager and render this file, or keep secrets out
+# of the file and template it at deploy time).
+
+[server]
+# Address the public + widget surface binds to. Behind a public ALB in prod.
+bind = "0.0.0.0:8080"
+# Proxy CIDRs trusted to set X-Forwarded-For, so per-IP rate limiting keys on
+# the real client rather than the load balancer.
+trusted_proxies = ["10.0.0.0/8"]
+# Per-IP public request budget per minute.
+rate_limit_per_min = 60
+# Ceiling on agent turns running concurrently across all sockets. Keep it below
+# the Postgres pool (default 16) so turns don't starve each other on a
+# connection.
+max_concurrent_turns = 8
+
+# The edge's OWN Postgres — customer sessions live here. Never the hub's DB.
+[postgres]
+url = "postgres://edge:CHANGE_ME@edge-db.internal:5432/workforce_edge"
+# TLS mode: "require" (default — managed Postgres over the network) or
+# "disable" (local plaintext dev only).
+sslmode = "require"
+# Seconds to keep retrying the initial connection before aborting boot.
+connect_budget_secs = 300
+
+# The edge's OWN Weaviate — agent memory + the customer-facing training corpus.
+[weaviate]
+url = "http://edge-weaviate.internal:8080"
+# api_key = "CHANGE_ME"   # when the instance is authenticated
+connect_budget_secs = 300
+
+[llm]
+# Provider: "anthropic" (default), "bedrock", "gemini", "openrouter", …
+#
+# Harbor runs on AWS Bedrock using the task's IAM role — no API key. Leave
+# api_key unset; credentials come from the task role, region from AWS_REGION.
+provider = "bedrock"
+# api_key = "sk-ant-CHANGE_ME"   # required for "anthropic"; unused for "bedrock"
+#
+# Tier-resolution family. Lets an agent's `model = "powerful"` map to the right
+# concrete model. Defaults from the provider (bedrock -> "bedrock.anthropic").
+# tier_key = "bedrock.anthropic"
+#
+# Install-wide default model when an agent doesn't pin one: a tier
+# ("powerful" / "standard" / "cheap") or a concrete model id.
+default_model = "standard"
+
+# One or more customer-facing agents. Each is embeddable in the company webapp
+# whose origins it names.
+[[agents]]
+id = "harbor-help"
+display_name = "Harbor Assistant"
+# The persona / instructions that become the agent's system prompt.
+system_prompt = """
+You are the Harbor customer assistant. Help the logged-in user with their
+orders, invoices, and account. Be concise and friendly. Only act through the
+tools you are given; never claim to have done something you did not do.
+"""
+# Greeting shown when a new conversation opens.
+welcome = "Hi! I can help with your orders, invoices, and account. What do you need?"
+# Optional per-agent model override — a tier or a concrete id; falls back to
+# [llm].default_model.
+# model = "powerful"
+
+[agents.embed]
+# Web origins allowed to load the widget and open a socket. Exact match only.
+allowed_origins = ["https://app.harbor.example"]
+# Closed tool allowlist. A tool is callable only if it matches exactly or via a
+# `prefix.*` glob. Empty ⇒ the agent calls no tools.
+allowed_tools = ["harbor.*"]
+# Keycloak realm issuer that must have signed a customer's token.
+keycloak_issuer = "https://auth.harbor.example/realms/harbor"
+# Pin the audience, or omit to verify signature + issuer + expiry only.
+# keycloak_audience = "harbor-web"
+
+[agents.embed.mcp]
+# The company MCP server this agent acts against, as the logged-in customer.
+url = "https://mcp.harbor.example"
+# OPTIONAL. A service credential to discover the tool list at startup. Omit it
+# and the tools are discovered lazily on the first customer turn using that
+# customer's own token — for MCP servers that accept any valid user token.
+# Per-customer tool calls always forward the customer's own token regardless.
+# discovery_credential = "SERVICE_TOKEN"
+
+[agents.embed.branding]
+title = "Harbor Help"
+accent_color = "#2563eb"

@@ -1,0 +1,15 @@
+-- Cross-process interrupt.
+--
+-- A new message interrupts the conversation's running turn through
+-- `host::begin_turn`, which cancels it via an in-memory `CancellationToken`. That
+-- only reaches a turn running in THIS process, so with more than one replica a
+-- customer's follow-up question could not stop the turn their previous one
+-- started: both ran to completion, both billed, and both wrote an answer.
+--
+-- The owning replica polls this column for its own turns and cancels locally when
+-- it is set, which is the one thing the interrupt needed that a per-process token
+-- could not do. Deliberately a flag rather than a message bus: the edge already
+-- depends on this database everywhere it runs, and a bus does not.
+--
+-- Created unqualified: the migration runner sets search_path to `edge_analytics`.
+ALTER TABLE active_turns ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMPTZ;

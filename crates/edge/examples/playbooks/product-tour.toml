@@ -1,0 +1,40 @@
+# Example customer-facing playbook for the edge.
+#
+# Point the edge at a directory of these with `playbooks_dir = "..."` in
+# edge.toml, then attach one to an agent with `playbook = "product-tour"` —
+# every new conversation is guided through the flow. The agent advances steps
+# with its `playbook` tool when the customer is ready; a `[[step.button]]`
+# entry with `goto` declares a branch the agent may take.
+
+[playbook]
+id = "product-tour"
+name = "Product tour"
+description = "Greets a new user and walks them through the product basics."
+
+[[step]]
+id = "welcome"
+title = "Welcome"
+prompt = """
+Warmly welcome the user. Ask what brought them here today and what they most
+want to get done, so the rest of the tour can focus on that.
+"""
+
+[[step]]
+id = "basics"
+title = "Show the basics"
+prompt = """
+Explain the two or three core features that matter for the goal the user gave
+you, one at a time. Check they're following before moving on.
+"""
+
+[[step.button]]
+label = "Skip to questions"
+goto = "questions"
+
+[[step]]
+id = "questions"
+title = "Questions"
+prompt = """
+Invite any remaining questions and answer them. When the user has no more
+questions, wish them well and finish the flow.
+"""

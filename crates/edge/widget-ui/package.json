@@ -1,0 +1,37 @@
+{
+  "name": "workforce-edge-widget",
+  "private": true,
+  "license": "Elastic-2.0",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "The customer-facing edge chat widget: a tiny loader that mounts a sandboxed iframe running the chat SPA.",
+  "scripts": {
+    "build": "npm run build:app && npm run build:loader",
+    "build:app": "vite build",
+    "build:loader": "vite build --config vite.loader.config.ts",
+    "dev": "vite",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "goldens": "vite-node scripts/goldens.mjs"
+  },
+  "dependencies": {
+    "@tanstack/react-table": "^8.21.3",
+    "echarts": "^6.0.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-markdown": "^9.1.0",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.1.0",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.1.0",
+    "vitest": "^3.2.0"
+  }
+}

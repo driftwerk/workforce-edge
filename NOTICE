@@ -1,0 +1,15 @@
+Workforce Edge
+Copyright (c) 2026 Kingsley Hendrickse
+
+Licensed under the Elastic License 2.0 (see LICENSE), except the bundled
+third-party data below, which keeps its own licence:
+
+- crates/edge/widget-ui/src/app/rich/geo/uk-postcode-areas.json —
+  UK postcode boundaries © Wikipedia contributors, CC BY-SA 3.0. The file is
+  offered under CC BY-SA 3.0. See NOTICE.md beside it.
+- crates/edge/widget-ui/src/app/rich/geo/world-countries.json — Natural Earth,
+  public domain. See NOTICE.md beside it.
+
+Rust and npm dependencies are used under their own licences, recorded in
+Cargo.lock and each UI's package-lock.json; the accepted licences are listed in
+deny.toml.

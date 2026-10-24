@@ -1,0 +1,30 @@
+# Thin runtime image for the standalone `workforce-edge` service.
+#
+# Unlike the hub image, this carries no agent toolchain, no embedded UI, and no
+# baked config — just the binary and the TLS/CA runtime it needs. The binary is
+# built by CI and copied in (see .github/workflows/image.yml).
+FROM debian:trixie-slim
+
+# curl is only here for the ECS container health check (curl -f /health).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG COMMIT_SHA=unknown
+ARG BUILD_DATE=unknown
+ENV COMMIT_SHA=${COMMIT_SHA} \
+    BUILD_DATE=${BUILD_DATE} \
+    RUST_LOG=info \
+    WORKFORCE_EDGE_CONFIG=/app/edge.toml
+
+COPY bins/workforce-edge /usr/local/bin/workforce-edge
+
+RUN useradd -u 1000 -m -s /bin/bash edge && mkdir -p /app && chown edge:edge /app
+USER edge
+WORKDIR /app
+EXPOSE 8080
+
+# The config is provided at runtime — mounted, or rendered from secrets — at the
+# path in WORKFORCE_EDGE_CONFIG. main.rs reads argv[1], then that env, then
+# ./edge.toml.
+ENTRYPOINT ["workforce-edge"]

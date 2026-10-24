@@ -1,0 +1,93 @@
+name: PR Check
+
+# Runs on every pull request and on main, on GitHub-hosted runners with a
+# read-only token and no repository secrets.
+
+concurrency:
+  group: pr-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions: {}
+
+env:
+  NODE_OPTIONS: --max-old-space-size=6144
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  ui:
+    name: UIs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        ui: [widget-ui, ui-admin, ui-platform]
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - working-directory: crates/edge/${{ matrix.ui }}
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+  rust:
+    name: Format, clippy and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      # The embedded-Postgres test harness downloads its binary through the
+      # GitHub API; the job's own read-only token avoids the anonymous limit.
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the UIs the binary embeds
+        run: |
+          for ui in widget-ui ui-admin ui-platform; do
+            npm --prefix "crates/edge/$ui" ci
+            npm --prefix "crates/edge/$ui" run build
+          done
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+        with:
+          tool: cargo-nextest,cargo-deny@0.20.2
+      - run: cargo deny check licenses
+      - run: cargo nextest run --workspace --no-fail-fast
+
+  # The one check branch protection requires.
+  ci-ok:
+    name: CI OK
+    if: always()
+    needs: [ui, rust]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for r in $RESULTS; do
+            case "$r" in success|skipped) ;; *) echo "a required job ended: $r"; exit 1 ;; esac
+          done

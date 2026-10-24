@@ -1,0 +1,801 @@
+:root {
+  /* Light defaults. applyTheme() overwrites every colour token below with the
+     resolved palette for the active mode (light or dark); these values are the
+     pre-init default and the fallback if a stale loader sends no palette. */
+  --wf-primary: #05405c;
+  --wf-primary-text: #ffffff;
+  --wf-user: #05405c;
+  --wf-user-text: #ffffff;
+  --wf-agent: #f1f5f9;
+  --wf-agent-text: #0f172a;
+  --wf-font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --wf-radius: 16px;
+  --wf-surface: #f7f9fc;
+  --wf-panel: #ffffff;
+  /* Composer message box; defaults to the panel it used to inherit. */
+  --wf-input-bg: var(--wf-panel);
+  --wf-border: #e6eaf0;
+  --wf-muted: #64748b;
+  --wf-strong: #0f172a;
+  /* Primary as a foreground/border on neutral surfaces. Set per mode by applyTheme
+     (an unset dark accent is lifted server-side to stay legible on dark surfaces);
+     this default only applies pre-init. */
+  --wf-accent: var(--wf-primary);
+  /* Fenced code stays dark in both schemes — not driven by the palette. */
+  --wf-code-bg: #0f172a;
+  --wf-code-text: #e2e8f0;
+  /* Panel drop shadow — togglable per-agent via --wf-shadow (set by applyTheme). */
+  --wf-shadow-default: 0 16px 48px rgba(15, 23, 42, 0.18), 0 4px 12px rgba(15, 23, 42, 0.08);
+  --wf-shadow: var(--wf-shadow-default);
+  /* Full-screen readable content width — "centered" (860px) or "wide". */
+  --wf-content-max: 860px;
+  /* Brand paint for the launcher, header, send button and avatar. Defaults to the
+     flat primary so those surfaces render identically when no gradient is configured
+     — and so a newer bundle against an older server (which ships no gradient field,
+     making setProperty a no-op) paints a colour rather than nothing. */
+  --wf-brand-gradient: var(--wf-primary);
+  /* Per-surface paint + whether it is zoomed. Both default to the shared brand paint
+     and its zoom, so an agent that configures neither renders as before. */
+  --wf-avatar-bg: var(--wf-brand-gradient);
+  --wf-send-bg: var(--wf-brand-gradient);
+  --wf-avatar-zoom: var(--wf-brand-zoom-size);
+  --wf-send-zoom: var(--wf-brand-zoom-size);
+  /* Borders that can be split off the shared hairline. */
+  --wf-input-border: var(--wf-border);
+  --wf-agent-border: var(--wf-border);
+}
+
+/* Scope color-scheme to the SOLID panel (never the transparent root): its
+   scrollbars and native controls (textarea, selects) then render dark, while the
+   iframe canvas stays transparent so the launcher and panel corners show the host
+   page through instead of a black box. */
+:root.wf-dark .wf-panel { color-scheme: dark; }
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: transparent; }
+body { font-family: var(--wf-font); -webkit-font-smoothing: antialiased; }
+#root, .wf-root { width: 100%; height: 100%; }
+
+/* `wf-y-*`/`wf-x-*` on the root name the viewport corner the widget is ACTUALLY
+   docked to. Once it can be dragged the operator's configured side is only its
+   starting point, so everything that hangs off a corner — the launcher, the resize
+   grip, the panel's entry animation — keys off these rather than the config. */
+.wf-y-b .wf-launch { bottom: 16px; }
+.wf-y-t .wf-launch { top: 16px; }
+.wf-x-r .wf-launch { right: 16px; }
+.wf-x-l .wf-launch { left: 16px; }
+
+/* A surface the customer can drag the widget by. The grab cursor is only right on
+   the header — the launcher is a button first, and must keep reading as clickable. */
+.wf-grab { user-select: none; touch-action: none; }
+.wf-head.wf-grab { cursor: grab; }
+.wf-head.wf-grab:active { cursor: grabbing; }
+
+/* ---- launcher ---------------------------------------------------------- */
+.wf-launch {
+  position: absolute;
+  border: 0;
+  cursor: pointer;
+  background: var(--wf-brand-gradient);
+  color: var(--wf-primary-text);
+  /* Sized to FIT the closed frame, which is the whole constraint here: the launcher is
+     56px inside an 84px iframe at a 16px inset, so a shadow may reach at most ~12px in
+     any direction. The old `0 8px 24px` reached 32px below and got sliced off at the
+     iframe's edge — which reads on the host page as a grey rectangle around the
+     launcher, not as a shadow. */
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.22), 0 1px 3px rgba(0, 0, 0, 0.1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  font-family: var(--wf-font);
+}
+.wf-launch:hover { transform: translateY(-1px) scale(1.04); }
+.wf-launch:active { transform: scale(0.97); }
+.wf-launch:focus-visible { outline: 3px solid color-mix(in srgb, var(--wf-primary) 40%, white); outline-offset: 2px; }
+.wf-launch-bubble { width: 56px; height: 56px; border-radius: 50%; }
+.wf-launch-pill { height: 52px; border-radius: 26px; padding: 0 20px; gap: 10px; font: 600 15px var(--wf-font); }
+.wf-launch img { width: 30px; height: 30px; border-radius: 8px; object-fit: cover; }
+
+/* `logo_fit: contain` — for a logo that is a bare mark (a white glyph on
+   transparency, as brand kits ship it): it sits ON the brand paint rather than being
+   a tile of its own, so no rounding, no crop, and no squashing by `cover`. Opt-in:
+   the default stays the rounded `cover` tile that suits a square logo. */
+:root.wf-logo-contain .wf-launch img,
+:root.wf-logo-contain .wf-avatar img,
+:root.wf-logo-contain .wf-logo,
+:root.wf-logo-contain .wf-empty-logo { border-radius: 0; object-fit: contain; }
+
+/* Small round controls zoom into the MIDDLE of the brand gradient instead of showing
+   its whole span. Across a 30–42px control the full span puts the palest stop under a
+   white glyph — measured at 1.76:1 against the brand pink, well under the 3:1 WCAG
+   wants for icons. Centring on the mid stop keeps the gradient visible while holding
+   the glyph legible, and matches how brand decks draw these (a mid-tone chip, not a
+   whole rainbow). Large surfaces — launcher, header — still show the full span.
+   NOTE: these must be re-stated wherever `background` is set as a SHORTHAND, since
+   that resets background-size; see `.wf-send` and `.wf-avatar` below. */
+:root {
+  --wf-brand-zoom-size: 260% 100%;
+  --wf-brand-zoom-pos: center;
+}
+
+/* `expand`: a circle that grows into a labelled pill on hover/focus. `width: auto`
+   is not transitionable, so the label animates its `max-width` from 0 to its own
+   measured width (`--wf-pill-label`, set by the SPA) behind `overflow: hidden`.
+   `max-width` is what makes the label MEASURABLE: it keeps the element's natural
+   content width in `scrollWidth` while rendering at 0 — a collapsed grid column
+   would report 0 for both, which is exactly how the first attempt mis-sized. */
+.wf-launch-expand {
+  height: 56px;
+  border-radius: 28px;
+  padding: 0 13px;
+  gap: 0;
+  font: 600 15px var(--wf-font);
+  /* Not `scale` like the other launchers: scaling *while* growing reads as jitter. */
+  transition: box-shadow 0.15s ease;
+}
+.wf-launch-expand .wf-launch-label {
+  display: block;
+  max-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  opacity: 0;
+  transition: max-width 0.22s ease, opacity 0.18s ease, margin-left 0.22s ease;
+}
+/* Keyboard users must get the label too, not just pointer users. */
+.wf-launch-expand:hover .wf-launch-label,
+.wf-launch-expand:focus-visible .wf-launch-label {
+  max-width: var(--wf-pill-label, 260px);
+  opacity: 1;
+  margin-left: 9px;
+}
+.wf-launch-expand:hover { transform: none; }
+
+/* ---- panel ------------------------------------------------------------- */
+.wf-panel {
+  position: absolute;
+  inset: 8px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--wf-panel);
+  border: 1px solid var(--wf-border);
+  border-radius: var(--wf-radius);
+  box-shadow: var(--wf-shadow);
+  animation: wf-in 0.2s ease-out;
+}
+.wf-full .wf-panel { inset: 0; border: 0; border-radius: 0; box-shadow: none; }
+
+/* Gradient ring around the panel — the DEFAULT treatment when a gradient is set but
+   the framed presentation is not. Two-layer background: the panel fill clipped to the
+   padding box, the brand paint to the (transparent) border box. Gated on `.wf-grad`
+   rather than riding the --wf-brand-gradient fallback, because this border is normally
+   the NEUTRAL --wf-border — falling back to the flat primary would recolour the border
+   of every install that never asked for a gradient. */
+:root.wf-grad:not(.wf-frame) .wf-panel {
+  border: 1px solid transparent;
+  background:
+    linear-gradient(var(--wf-panel), var(--wf-panel)) padding-box,
+    var(--wf-brand-gradient) border-box;
+}
+:root.wf-grad:not(.wf-frame) .wf-full .wf-panel { background: var(--wf-panel); }
+
+/* ---- framed presentation (opt-in: `frame = true`) ---------------------- */
+/* The brand paint fills the panel and the conversation is inset inside it, so one
+   continuous run of paint sits behind the header AND frames the body. The header is
+   transparent and shows the panel's own paint — painting it separately makes the
+   gradient visibly restart at the body's top edge.
+   Deliberately NOT implied by `.wf-grad`: brands differ, and wanting a gradient does
+   not mean wanting the panel restructured. Every install that doesn't ask for this
+   keeps its flat panel and hairline border. */
+:root.wf-frame {
+  /* Thickness of the brand paint showing around the inset body. */
+  --wf-frame-w: 2px;
+  /* The body's top corners are rounded slightly MORE than the panel's; its bottom
+     corners sit concentric inside the frame. */
+  --wf-inner-top: calc(var(--wf-radius) + 2px);
+  /* Concentric with the outer corner. `max(0px, …)` matters: a frame thicker than the
+     radius would otherwise compute a NEGATIVE radius, which is invalid CSS and drops
+     the whole declaration — square corners rather than a clamped one. */
+  --wf-inner-bottom: max(0px, calc(var(--wf-radius) - var(--wf-frame-w)));
+}
+:root.wf-frame .wf-panel { background: var(--wf-brand-gradient); border: 0; }
+:root.wf-frame .wf-head { background: transparent; }
+/* Whatever occupies the body slot — thread, history list, or the connecting state.
+   NOTE the composer is a CHILD of `.wf-thread`, not its sibling, so the inset and the
+   rounding belong here and here only: insetting the composer separately double-inset
+   it horizontally and left the thread running to the panel's bottom edge, which ate
+   the bottom of the frame entirely. `overflow: hidden` clips the composer's corners
+   to this radius, so it needs none of its own. */
+:root.wf-frame .wf-thread,
+:root.wf-frame .wf-history,
+:root.wf-frame .wf-connecting {
+  margin: 0 var(--wf-frame-w) var(--wf-frame-w);
+  border-radius: var(--wf-inner-top) var(--wf-inner-top) var(--wf-inner-bottom)
+    var(--wf-inner-bottom);
+  overflow: hidden;
+}
+/* Fullscreen has nothing to frame — the panel IS the viewport. The paint stays as the
+   header's backdrop. */
+:root.wf-frame .wf-full .wf-thread,
+:root.wf-frame .wf-full .wf-history,
+:root.wf-frame .wf-full .wf-connecting { margin: 0; border-radius: 0; }
+
+/* Send button shape — its own opt-in (`send_shape = "circle"`). */
+:root.wf-send-circle .wf-send { border-radius: 50%; }
+
+/* Corner grip to drag-resize the panel. It sits on the corner diagonally opposite
+   the anchor, because that is the direction the panel grows. Its mark is drawn on
+   the two edges meeting at that corner, in the header's text colour when it lands
+   over the header and a neutral one when the panel is top-anchored and it lands
+   over the composer instead. */
+.wf-resize { position: absolute; width: 22px; height: 22px; z-index: 6; touch-action: none; user-select: none; }
+.wf-y-b .wf-resize { top: 0; }
+.wf-y-t .wf-resize { bottom: 0; }
+.wf-x-r .wf-resize { left: 0; }
+.wf-x-l .wf-resize { right: 0; }
+.wf-y-b.wf-x-r .wf-resize, .wf-y-t.wf-x-l .wf-resize { cursor: nwse-resize; }
+.wf-y-b.wf-x-l .wf-resize, .wf-y-t.wf-x-r .wf-resize { cursor: nesw-resize; }
+.wf-resize::after {
+  content: ""; position: absolute; inset: 6px; border: 0 solid var(--wf-primary-text);
+  border-radius: 3px; opacity: 0.45; transition: opacity 0.12s;
+}
+.wf-y-b .wf-resize::after { border-top-width: 2px; }
+.wf-y-t .wf-resize::after { border-bottom-width: 2px; border-color: var(--wf-muted); }
+.wf-x-r .wf-resize::after { border-left-width: 2px; }
+.wf-x-l .wf-resize::after { border-right-width: 2px; }
+.wf-resize:hover::after { opacity: 0.9; }
+/* Grow out of the launcher: the panel scales up from whichever corner it is docked
+   to, so it reads as the launcher opening rather than a card appearing. The corner
+   comes from the same `.wf-y-*`/`.wf-x-*` root classes everything else keys off, so a
+   dragged widget animates from its new corner. */
+@keyframes wf-in { from { opacity: 0; transform: scale(0.88); } to { opacity: 1; transform: none; } }
+.wf-y-b.wf-x-r .wf-panel { transform-origin: bottom right; }
+.wf-y-b.wf-x-l .wf-panel { transform-origin: bottom left; }
+.wf-y-t.wf-x-r .wf-panel { transform-origin: top right; }
+.wf-y-t.wf-x-l .wf-panel { transform-origin: top left; }
+
+.wf-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 14px 16px;
+  background: var(--wf-brand-gradient);
+  color: var(--wf-primary-text);
+  flex-shrink: 0;
+}
+.wf-head-l { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.wf-logo { width: 34px; height: 34px; border-radius: 9px; object-fit: cover; }
+.wf-head-text { min-width: 0; }
+.wf-title { font: 600 16px/1.25 var(--wf-font); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wf-sub { font: 400 12.5px/1.35 var(--wf-font); opacity: 0.82; margin-top: 1px; }
+.wf-acts { display: flex; gap: 2px; flex-shrink: 0; }
+.wf-ico {
+  border: 0; background: transparent; color: var(--wf-primary-text);
+  cursor: pointer; width: 34px; height: 34px; border-radius: 9px;
+  font-size: 16px; line-height: 1; display: flex; align-items: center; justify-content: center;
+  opacity: 0.85; transition: background 0.12s, opacity 0.12s;
+}
+.wf-ico:hover { opacity: 1; background: rgba(255, 255, 255, 0.16); }
+.wf-ico:focus-visible { outline: 2px solid rgba(255, 255, 255, 0.7); outline-offset: -2px; }
+
+/* ---- thread ------------------------------------------------------------ */
+.wf-thread { display: flex; flex-direction: column; flex: 1; min-height: 0; background: var(--wf-surface); }
+.wf-viewport { flex: 1; overflow-y: auto; scroll-behavior: smooth; }
+.wf-scroll { display: flex; flex-direction: column; gap: 12px; padding: 18px 16px 8px; min-height: 100%; box-sizing: border-box; }
+.wf-row { display: flex; gap: 9px; align-items: flex-start; }
+.wf-row-user { justify-content: flex-end; }
+.wf-row-assistant { justify-content: flex-start; }
+
+/* Brand avatar beside an agent reply. Deliberately a SIBLING of the bubble/.wf-msg
+   inside .wf-row, never a wrapper: the rich-output width rules below select
+   `.wf-row-assistant > .wf-bubble` / `> .wf-msg` as DIRECT children, and wrapping
+   them would silently collapse every chart, table and map to text width. */
+.wf-avatar {
+  flex-shrink: 0;
+  width: 30px; height: 30px; border-radius: 50%;
+  background: var(--wf-avatar-bg);
+  background-size: var(--wf-avatar-zoom);
+  background-position: var(--wf-brand-zoom-pos);
+  color: var(--wf-primary-text);
+  display: flex; align-items: center; justify-content: center;
+  overflow: hidden;
+  /* Nudged down so it aligns with the first line of text, not the bubble's top edge. */
+  margin-top: 2px;
+}
+.wf-avatar img { width: 18px; height: 18px; }
+.wf-avatar svg { width: 16px; height: 16px; }
+/* On a wide (fullscreen) panel, keep the conversation a readable centred column. */
+.wf-full .wf-scroll { padding: 24px 16px 12px; }
+.wf-full .wf-scroll > * { width: 100%; max-width: var(--wf-content-max); margin-inline: auto; }
+.wf-bubble {
+  max-width: 86%;
+  padding: 10px 14px;
+  border-radius: 16px;
+  font-size: 14.5px;
+  line-height: 1.5;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+.wf-bubble-user { background: var(--wf-user); color: var(--wf-user-text); border-bottom-right-radius: 5px; }
+.wf-bubble-assistant { background: var(--wf-agent); color: var(--wf-agent-text); border: 1px solid var(--wf-agent-border); border-bottom-left-radius: 5px; }
+/* Assistant bubble + its rating control, stacked so the thumbs sit beneath it. */
+.wf-msg { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; min-width: 0; max-width: 86%; }
+.wf-msg .wf-bubble { max-width: 100%; }
+/* A message carrying a chart or data table needs room: text bubbles hug their
+   content, but a chart's width:100% would collapse to the text width. Give such
+   messages a definite width so the chart/table fills the available space (capped
+   at the readable column) — this makes a dragged-wider panel expand like
+   fullscreen does, instead of staying squashed. */
+.wf-row-assistant:has(.wf-chart, .wf-rt, .wf-tablewrap, .wf-map, .wf-dg) > .wf-bubble,
+.wf-row-assistant:has(.wf-chart, .wf-rt, .wf-tablewrap, .wf-map, .wf-dg) > .wf-msg {
+  width: 100%;
+  max-width: min(86%, var(--wf-content-max));
+}
+
+/* ---- attachments (agent downloads, and the customer's own uploads) ----- */
+.wf-attachments { display: flex; flex-direction: column; gap: 5px; align-items: flex-start; max-width: 100%; }
+.wf-attachment-wrap { display: flex; flex-direction: column; gap: 3px; align-items: flex-start; max-width: 100%; }
+/* The customer's side of the transcript hangs off the right edge, so their own
+   uploads stack to the right of the column the same way their bubbles do. */
+.wf-row-user > .wf-msg,
+.wf-row-user .wf-attachments,
+.wf-row-user .wf-attachment-wrap { align-items: flex-end; }
+.wf-attachment-err { font-size: 12px; color: #dc2626; }
+.wf-attachment {
+  border: 1px solid var(--wf-border); background: var(--wf-panel); color: var(--wf-accent);
+  cursor: pointer; border-radius: 10px; padding: 7px 12px;
+  font: 13px var(--wf-font); max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  transition: background 0.12s, border-color 0.12s;
+}
+.wf-attachment:hover { background: color-mix(in srgb, var(--wf-primary) 8%, var(--wf-panel)); border-color: var(--wf-accent); }
+.wf-attachment:focus-visible { outline: 2px solid color-mix(in srgb, var(--wf-primary) 45%, white); outline-offset: 1px; }
+.wf-attachment:disabled { cursor: default; opacity: 0.6; }
+
+/* ---- feedback (thumbs) ------------------------------------------------- */
+.wf-fb { display: flex; flex-direction: column; gap: 6px; padding-left: 2px; }
+.wf-fb-row { display: flex; align-items: center; gap: 4px; }
+.wf-fb-btn {
+  border: 0; background: transparent; color: var(--wf-muted); cursor: pointer;
+  width: 26px; height: 26px; border-radius: 8px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  transition: background 0.12s, color 0.12s;
+}
+.wf-fb-btn:hover { background: color-mix(in srgb, var(--wf-muted) 14%, transparent); color: var(--wf-strong); }
+.wf-fb-btn:focus-visible { outline: 2px solid color-mix(in srgb, var(--wf-primary) 45%, white); outline-offset: 1px; }
+.wf-fb-btn:disabled { cursor: default; opacity: 0.5; }
+/* The filled state is the durable record that a vote landed — strong enough to
+   read at 26px, not a 12% wash. */
+.wf-fb-btn.wf-fb-on { color: var(--wf-accent); background: color-mix(in srgb, var(--wf-primary) 22%, transparent); }
+.wf-fb-btn.wf-fb-down.wf-fb-on { color: #dc2626; background: color-mix(in srgb, #dc2626 22%, transparent); }
+/* Each acknowledgement remounts (keyed per submit) so this fade re-runs. */
+.wf-fb-note { font-size: 12px; color: var(--wf-muted); animation: wf-fb-note-in 0.25s ease-out; }
+@keyframes wf-fb-note-in { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+.wf-fb-err { font-size: 12px; color: #dc2626; }
+.wf-fb-comment { display: flex; gap: 6px; align-items: center; }
+.wf-fb-input {
+  flex: 1; min-width: 0; border: 1px solid var(--wf-border); border-radius: 10px;
+  padding: 7px 11px; font: 13px var(--wf-font); color: var(--wf-strong); background: var(--wf-panel); outline: none;
+}
+.wf-fb-input:focus { border-color: var(--wf-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--wf-primary) 14%, transparent); }
+.wf-fb-send {
+  border: 0; background: var(--wf-primary); color: var(--wf-primary-text); cursor: pointer;
+  border-radius: 10px; padding: 7px 13px; font: 600 13px var(--wf-font); flex-shrink: 0;
+  transition: filter 0.12s, opacity 0.12s;
+}
+.wf-fb-send:hover { filter: brightness(1.06); }
+.wf-fb-send:disabled { opacity: 0.5; cursor: default; }
+.wf-fb-send:focus-visible { outline: 3px solid color-mix(in srgb, var(--wf-primary) 40%, white); outline-offset: 2px; }
+
+/* markdown inside assistant bubbles */
+.wf-md > :first-child { margin-top: 0; }
+.wf-md > :last-child { margin-bottom: 0; }
+.wf-md p { margin: 0 0 8px; }
+.wf-md ul, .wf-md ol { margin: 6px 0; padding-left: 20px; }
+.wf-md li { margin: 3px 0; }
+.wf-md h1, .wf-md h2, .wf-md h3, .wf-md h4 { margin: 12px 0 6px; line-height: 1.25; font-weight: 650; }
+.wf-md h1 { font-size: 18px; } .wf-md h2 { font-size: 16px; } .wf-md h3 { font-size: 15px; }
+.wf-md a { color: var(--wf-accent); font-weight: 500; text-decoration: underline; }
+.wf-md hr { border: 0; border-top: 1px solid var(--wf-border); margin: 12px 0; }
+.wf-md blockquote { margin: 8px 0; padding: 2px 0 2px 12px; border-left: 3px solid var(--wf-border); color: var(--wf-muted); }
+
+/* inline code + fenced code blocks (scroll, never clip) */
+.wf-md :not(pre) > code {
+  background: color-mix(in srgb, var(--wf-primary) 9%, var(--wf-panel));
+  color: var(--wf-strong); padding: 1px 5px; border-radius: 5px;
+  font-size: 12.5px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.wf-md pre {
+  margin: 8px 0; padding: 12px 14px; border-radius: 10px; overflow-x: auto;
+  background: var(--wf-code-bg); color: var(--wf-code-text);
+}
+.wf-md pre code {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.5; white-space: pre; background: none; color: inherit; padding: 0;
+}
+
+/* tables: wrapped so wide ones scroll, with header + zebra */
+.wf-tablewrap { margin: 8px 0; overflow-x: auto; border: 1px solid var(--wf-border); border-radius: 10px; }
+.wf-md table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.wf-md th, .wf-md td { padding: 7px 12px; text-align: left; border-bottom: 1px solid var(--wf-border); white-space: nowrap; }
+.wf-md th + th, .wf-md td + td { border-left: 1px solid var(--wf-border); }
+.wf-md thead th { background: var(--wf-surface); font-weight: 650; }
+.wf-md tbody tr:last-child td { border-bottom: 0; }
+.wf-md tbody tr:nth-child(even) { background: color-mix(in srgb, var(--wf-surface) 55%, var(--wf-panel)); }
+
+/* ---- rich output: skeleton, table controls, chart --------------------- */
+.wf-skel {
+  margin: 8px 0; border: 1px solid var(--wf-border); border-radius: 10px;
+  background: linear-gradient(100deg, var(--wf-surface) 40%, color-mix(in srgb, var(--wf-surface) 40%, var(--wf-panel)) 50%, var(--wf-surface) 60%);
+  background-size: 200% 100%;
+  animation: wf-shimmer 1.4s linear infinite;
+  display: flex; align-items: center; justify-content: center;
+}
+.wf-skel-table { height: 180px; }
+.wf-skel-chart { height: 280px; }
+.wf-skel-form { height: 200px; }
+.wf-skel-map { height: 420px; }
+.wf-skel-diagram { height: 260px; }
+.wf-skel-label { font-size: 13px; color: var(--wf-muted); }
+@keyframes wf-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
+.wf-rt { margin: 8px 0; min-width: 0; }
+.wf-rt-title, .wf-chart-title, .wf-map-title, .wf-dg-title { font-size: 13.5px; font-weight: 650; margin-bottom: 6px; }
+.wf-rt .wf-tablewrap { margin: 0; }
+.wf-rt-bar { display: flex; gap: 6px; margin-bottom: 6px; }
+.wf-rt-search {
+  flex: 1; min-width: 0; border: 1px solid var(--wf-border); border-radius: 8px;
+  padding: 5px 9px; font: 12.5px var(--wf-font); color: var(--wf-strong); background: var(--wf-panel); outline: none;
+}
+.wf-rt-search:focus { border-color: var(--wf-accent); }
+.wf-rt-btn {
+  border: 1px solid var(--wf-border); background: var(--wf-panel); color: var(--wf-accent);
+  cursor: pointer; border-radius: 8px; padding: 4px 9px; font: 12.5px var(--wf-font);
+  flex-shrink: 0; transition: background 0.12s, border-color 0.12s;
+}
+.wf-rt-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--wf-primary) 8%, var(--wf-panel)); border-color: var(--wf-accent); }
+.wf-rt-btn:disabled { opacity: 0.45; cursor: default; }
+.wf-rt-btn.wf-rt-on { background: color-mix(in srgb, var(--wf-primary) 12%, var(--wf-panel)); border-color: var(--wf-accent); }
+.wf-rt-sort {
+  border: 0; background: none; padding: 0; cursor: pointer;
+  font: inherit; font-weight: 650; color: inherit; display: inline-flex; gap: 4px; align-items: center;
+}
+.wf-rt-dir { font-size: 9px; color: var(--wf-accent); min-width: 10px; }
+.wf-rt-filters th { background: var(--wf-surface); padding: 4px 8px; }
+.wf-rt-range { display: flex; gap: 4px; }
+.wf-rt-filter {
+  width: 100%; min-width: 64px; border: 1px solid var(--wf-border); border-radius: 6px;
+  padding: 3px 7px; font: 12px var(--wf-font); color: var(--wf-strong); background: var(--wf-panel); outline: none;
+}
+.wf-rt-filter:focus { border-color: var(--wf-accent); }
+.wf-rt-foot {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 6px; font-size: 12px; color: var(--wf-muted);
+}
+.wf-rt-count { flex: 1; }
+.wf-rt-pager { display: inline-flex; align-items: center; gap: 5px; }
+.wf-rt-page { min-width: 44px; text-align: center; }
+.wf-rt-size {
+  border: 1px solid var(--wf-border); border-radius: 8px; padding: 3px 6px;
+  font: 12px var(--wf-font); color: var(--wf-strong); background: var(--wf-panel);
+}
+.wf-rt-empty { text-align: center; color: var(--wf-muted); padding: 14px; }
+.wf-rt-msg, .wf-map-msg { margin: 8px 0; padding: 12px 14px; border: 1px solid var(--wf-border); border-radius: 10px; font-size: 13px; color: var(--wf-muted); }
+.wf-rt-msg .wf-rt-btn, .wf-map-msg .wf-rt-btn { margin-left: 6px; }
+
+.wf-chart { margin: 8px 0; min-width: 0; }
+.wf-chart-plot { width: 100%; height: 280px; min-width: 220px; }
+
+/* ---- rich output: wf-form --------------------------------------------- */
+.wf-form { margin: 8px 0; min-width: 0; display: flex; flex-direction: column; gap: 11px; }
+.wf-form-title { font-size: 13.5px; font-weight: 650; }
+.wf-form-note { font-size: 12.5px; color: var(--wf-muted); }
+.wf-form-field { display: flex; flex-direction: column; gap: 4px; }
+.wf-form-label { font-size: 12.5px; font-weight: 600; color: #0f172a; }
+.wf-form-req { color: #ef4444; }
+.wf-form-input {
+  width: 100%; box-sizing: border-box; border: 1px solid var(--wf-border); border-radius: 8px;
+  padding: 7px 10px; font: 13px var(--wf-font); color: #0f172a; background: #fff; outline: none;
+}
+.wf-form-input:focus {
+  border-color: var(--wf-primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--wf-primary) 14%, transparent);
+}
+.wf-form-input:disabled { background: var(--wf-surface); color: var(--wf-muted); cursor: default; }
+textarea.wf-form-input { resize: vertical; min-height: 60px; line-height: 1.45; }
+select.wf-form-select { appearance: none; cursor: pointer; }
+.wf-form-group { display: flex; flex-direction: column; gap: 6px; padding: 2px 0; }
+.wf-form-check {
+  display: flex; align-items: center; gap: 8px; font: 13px var(--wf-font); color: #0f172a; cursor: pointer;
+}
+.wf-form-check input { accent-color: var(--wf-primary); }
+.wf-form-help { font-size: 12px; color: var(--wf-muted); }
+.wf-form-error { font-size: 12px; color: #ef4444; }
+.wf-form-combo { position: relative; }
+.wf-form-options {
+  position: absolute; z-index: 5; left: 0; right: 0; top: calc(100% + 3px); margin: 0; padding: 4px;
+  list-style: none; background: #fff; border: 1px solid var(--wf-border); border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.12); max-height: 200px; overflow-y: auto;
+}
+.wf-form-option {
+  display: block; width: 100%; text-align: left; border: 0; background: none; cursor: pointer;
+  border-radius: 6px; padding: 6px 8px; font: 13px var(--wf-font); color: #0f172a;
+}
+.wf-form-option:hover { background: color-mix(in srgb, var(--wf-primary) 10%, #fff); }
+.wf-form-opt-msg { padding: 6px 8px; cursor: default; }
+.wf-form-actions { display: flex; }
+.wf-form-submit {
+  border: 0; background: var(--wf-primary); color: var(--wf-primary-text); cursor: pointer;
+  border-radius: 10px; padding: 8px 16px; font: 600 13px var(--wf-font);
+  transition: opacity 0.12s;
+}
+.wf-form-submit:hover:not(:disabled) { opacity: 0.92; }
+.wf-form-submit:disabled { opacity: 0.5; cursor: default; }
+.wf-form-submit:focus-visible { outline: 3px solid color-mix(in srgb, var(--wf-primary) 40%, white); outline-offset: 2px; }
+
+/* ---- rich output: wf-map ---------------------------------------------- */
+.wf-map { margin: 8px 0; min-width: 0; }
+.wf-map-canvas { position: relative; }
+.wf-map-plot { width: 100%; height: 420px; min-width: 220px; }
+.wf-map-zoom, .wf-dg-zoom { position: absolute; top: 8px; right: 8px; display: flex; flex-direction: column; gap: 4px; }
+.wf-map-zoom button, .wf-dg-zoom button {
+  width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--wf-border); border-radius: 7px; background: var(--wf-agent);
+  color: var(--wf-agent-text); font: 600 17px/1 var(--wf-font); cursor: pointer;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12); transition: background 0.12s;
+}
+.wf-map-zoom button:hover, .wf-dg-zoom button:hover { background: color-mix(in srgb, var(--wf-primary) 10%, var(--wf-agent)); }
+.wf-map-note { margin-top: 6px; font-size: 12px; color: var(--wf-muted); }
+.wf-map-credit { margin-top: 4px; font-size: 11px; color: var(--wf-muted); opacity: 0.75; }
+
+/* ---- rich output: wf-diagram ------------------------------------------ */
+/* The SVG is drawn by us, so every colour is a theme variable rather than a
+   value baked in at render time — light/dark follows the host with no
+   re-render, which the echarts-backed blocks cannot do. */
+/* `position: relative` is load-bearing, not decoration: the screen-reader outline
+   below is absolutely positioned, and with no positioned ancestor between here and
+   `.wf-panel` it resolved against the PANEL — at a static position hundreds of px
+   down the transcript. That made the panel (overflow: hidden, so silently
+   scrollable) permanently over-scrollable, and a stray scroll of it — the composer
+   focus on mount, taken while the frame is still launcher-sized — then never
+   clamped back to 0, leaving the header scrolled out of sight for the rest of the
+   session. Containing the outline here keeps the panel's scroll height at exactly
+   its own height, which is what lets that clamp heal the scroll. */
+.wf-dg { position: relative; margin: 8px 0; min-width: 0; font-size: 13px; }
+/* The frame anchors the zoom control; the canvas inside it is what scrolls, so
+   the buttons stay put instead of scrolling away with the diagram. Most
+   diagrams fit under the cap and never scroll at all. */
+.wf-dg-frame { position: relative; }
+.wf-dg-canvas { overflow: auto; max-height: min(70vh, 560px); }
+.wf-dg-svg { display: block; margin-inline: auto; }
+.wf-dg-shape { fill: var(--wf-agent); stroke: var(--wf-border); stroke-width: 1.4; stroke-linejoin: round; }
+.wf-dg-text { fill: var(--wf-agent-text); font-size: 13px; }
+
+/* Lane hues: colour on a diagram encodes WHICH GROUP owns a step, nothing else.
+   The dark steps are selected, not derived — the dark lightness band is narrower
+   and lower, so blue/yellow/violet are all different values. Kept in sync with
+   LANE_HUES (palette.ts) by a test; the export needs literal hex, the renderer
+   wants variables so a theme switch costs no re-render. */
+.wf-dg {
+  --wf-lane-1: #2a78d6;
+  --wf-lane-2: #1baf7a;
+  --wf-lane-3: #eda100;
+  --wf-lane-4: #4a3aa7;
+  --wf-lane-5: #e34948;
+}
+:root.wf-dark .wf-dg {
+  --wf-lane-1: #3d86e0;
+  --wf-lane-2: #1baf7a;
+  --wf-lane-3: #b87a00;
+  --wf-lane-4: #7a68dd;
+  --wf-lane-5: #e34948;
+}
+.wf-dg-node.lane-1 .wf-dg-shape { stroke: var(--wf-lane-1); fill: color-mix(in srgb, var(--wf-lane-1) 12%, var(--wf-agent)); }
+.wf-dg-node.lane-2 .wf-dg-shape { stroke: var(--wf-lane-2); fill: color-mix(in srgb, var(--wf-lane-2) 12%, var(--wf-agent)); }
+.wf-dg-node.lane-3 .wf-dg-shape { stroke: var(--wf-lane-3); fill: color-mix(in srgb, var(--wf-lane-3) 12%, var(--wf-agent)); }
+.wf-dg-node.lane-4 .wf-dg-shape { stroke: var(--wf-lane-4); fill: color-mix(in srgb, var(--wf-lane-4) 12%, var(--wf-agent)); }
+.wf-dg-node.lane-5 .wf-dg-shape { stroke: var(--wf-lane-5); fill: color-mix(in srgb, var(--wf-lane-5) 12%, var(--wf-agent)); }
+.wf-dg-group.lane-1 rect { stroke: var(--wf-lane-1); } .wf-dg-group.lane-1 text { fill: var(--wf-lane-1); }
+.wf-dg-group.lane-2 rect { stroke: var(--wf-lane-2); } .wf-dg-group.lane-2 text { fill: var(--wf-lane-2); }
+.wf-dg-group.lane-3 rect { stroke: var(--wf-lane-3); } .wf-dg-group.lane-3 text { fill: var(--wf-lane-3); }
+.wf-dg-group.lane-4 rect { stroke: var(--wf-lane-4); } .wf-dg-group.lane-4 text { fill: var(--wf-lane-4); }
+.wf-dg-group.lane-5 rect { stroke: var(--wf-lane-5); } .wf-dg-group.lane-5 text { fill: var(--wf-lane-5); }
+.wf-dg-lifeline.lane-1 line { stroke: var(--wf-lane-1); } .wf-dg-lifeline.lane-1 .wf-dg-shape { stroke: var(--wf-lane-1); fill: color-mix(in srgb, var(--wf-lane-1) 12%, var(--wf-agent)); }
+.wf-dg-lifeline.lane-2 line { stroke: var(--wf-lane-2); } .wf-dg-lifeline.lane-2 .wf-dg-shape { stroke: var(--wf-lane-2); fill: color-mix(in srgb, var(--wf-lane-2) 12%, var(--wf-agent)); }
+.wf-dg-lifeline.lane-3 line { stroke: var(--wf-lane-3); } .wf-dg-lifeline.lane-3 .wf-dg-shape { stroke: var(--wf-lane-3); fill: color-mix(in srgb, var(--wf-lane-3) 12%, var(--wf-agent)); }
+.wf-dg-lifeline.lane-4 line { stroke: var(--wf-lane-4); } .wf-dg-lifeline.lane-4 .wf-dg-shape { stroke: var(--wf-lane-4); fill: color-mix(in srgb, var(--wf-lane-4) 12%, var(--wf-agent)); }
+.wf-dg-lifeline.lane-5 line { stroke: var(--wf-lane-5); } .wf-dg-lifeline.lane-5 .wf-dg-shape { stroke: var(--wf-lane-5); fill: color-mix(in srgb, var(--wf-lane-5) 12%, var(--wf-agent)); }
+
+/* Status outranks identity — these follow the lane rules so equal specificity
+   resolves in their favour. A reserved status hue must never read as a lane. */
+.wf-dg-node.tone-accent .wf-dg-shape { stroke: var(--wf-primary); fill: color-mix(in srgb, var(--wf-primary) 10%, var(--wf-agent)); }
+.wf-dg-node.tone-good .wf-dg-shape { stroke: #1baf7a; fill: color-mix(in srgb, #1baf7a 12%, var(--wf-agent)); }
+.wf-dg-node.tone-warn .wf-dg-shape { stroke: #eda100; fill: color-mix(in srgb, #eda100 14%, var(--wf-agent)); }
+.wf-dg-node.tone-bad .wf-dg-shape { stroke: #e34948; fill: color-mix(in srgb, #e34948 12%, var(--wf-agent)); }
+.wf-dg-line { fill: none; stroke: var(--wf-muted); stroke-width: 1.4; stroke-linecap: round; }
+.wf-dg-edge.style-dashed .wf-dg-line { stroke-dasharray: 5 4; }
+.wf-dg-head { fill: var(--wf-muted); stroke: none; }
+.wf-dg-chip { fill: var(--wf-agent); stroke: none; }
+.wf-dg-edge-text { fill: var(--wf-muted); font-size: 12px; }
+.wf-dg-group rect { fill: none; stroke: var(--wf-border); stroke-dasharray: 4 4; }
+.wf-dg-group text { fill: var(--wf-muted); font-size: 12px; }
+.wf-dg-lifeline line { stroke: var(--wf-border); stroke-dasharray: 4 4; }
+.wf-dg-note .wf-dg-shape { fill: var(--wf-surface); stroke: var(--wf-border); }
+.wf-dg-note-text { margin-top: 6px; font-size: 12px; color: var(--wf-muted); }
+.wf-dg-actions { margin-top: 6px; display: flex; gap: 6px; }
+
+/* Screen-reader-only: kept in the layout tree (not display:none) so assistive
+   tech still reads it. */
+.wf-sr-only {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wf-skel { animation: none; }
+}
+
+/* ---- inline images ----------------------------------------------------- */
+/* Bytes arrive through an authenticated fetch, so these render from an object
+   URL rather than a src the browser can resolve on its own. */
+.wf-img { margin: 6px 0 0; display: flex; flex-direction: column; gap: 4px; max-width: 100%; }
+.wf-img-btn {
+  padding: 0; border: 1px solid var(--wf-border); border-radius: 10px; background: var(--wf-agent);
+  cursor: zoom-in; overflow: hidden; line-height: 0; max-width: 100%;
+}
+.wf-img-btn:focus-visible { outline: 2px solid var(--wf-accent); outline-offset: 2px; }
+.wf-img-btn img { display: block; max-width: 100%; height: auto; max-height: 240px; object-fit: contain; }
+.wf-img-expanded .wf-img-btn { cursor: zoom-out; }
+.wf-img-expanded .wf-img-btn img { max-height: none; }
+.wf-img figcaption {
+  display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--wf-muted); min-width: 0;
+}
+.wf-img-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-img-dl {
+  border: 0; background: none; padding: 0; cursor: pointer;
+  font: inherit; color: var(--wf-accent); text-decoration: underline; flex: none;
+}
+.wf-img-skel {
+  margin: 6px 0 0; height: 120px; border-radius: 10px; border: 1px solid var(--wf-border);
+  display: flex; align-items: center; justify-content: center; background: var(--wf-surface);
+}
+
+/* ---- wf-image: pictures the agent chose to show ------------------------ */
+/* Several images in one block is the common case ("show me the photos for this
+   item"), so the container is a grid that collapses to one column in a narrow
+   panel — `auto-fill` rather than a fixed count, because the panel is dragged. */
+.wf-rimgs { display: flex; flex-direction: column; gap: 8px; margin: 6px 0 0; max-width: 100%; }
+.wf-rimgs-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px;
+}
+.wf-rimg { margin: 0; display: flex; flex-direction: column; gap: 4px; min-width: 0; max-width: 100%; }
+.wf-rimg figcaption { font-size: 12px; color: var(--wf-muted); }
+/* One picture on its own gets the taller cap a single attachment gets; in a
+   grid they are thumbnails until expanded, or one long image would set the
+   row height for every sibling. */
+.wf-rimgs-grid .wf-img-btn img { max-height: 160px; width: 100%; }
+.wf-rimg-expanded { grid-column: 1 / -1; }
+.wf-rimg-expanded .wf-img-btn { cursor: zoom-out; }
+.wf-rimg-expanded .wf-img-btn img { max-height: none; }
+/* A named file that will not load is the EXPECTED outcome of a hallucinated id
+   or a TTL-swept artifact — it has to read as a stated fact, not a broken page. */
+.wf-rimg-missing {
+  padding: 16px 12px; border: 1px dashed var(--wf-border); border-radius: 10px;
+  background: var(--wf-surface); color: var(--wf-muted); font-size: 12px; text-align: center;
+}
+
+/* ---- attachments: composer, chips, canvas ------------------------------ */
+.wf-composer-row { display: flex; align-items: flex-end; gap: 8px; width: 100%; }
+.wf-composer-drop { outline: 2px dashed var(--wf-accent); outline-offset: -4px; }
+.wf-file-input { display: none; }
+.wf-attach-btn {
+  flex: none; width: 34px; height: 34px; border: 1px solid var(--wf-border); border-radius: 9px;
+  background: var(--wf-panel); cursor: pointer; font-size: 15px; line-height: 1;
+  color: var(--wf-muted); transition: background 0.12s, border-color 0.12s;
+}
+.wf-attach-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--wf-primary) 8%, var(--wf-panel)); border-color: var(--wf-accent); }
+.wf-attach-btn:disabled { opacity: 0.45; cursor: default; }
+.wf-attach-btn:focus-visible { outline: 2px solid var(--wf-accent); outline-offset: 2px; }
+
+.wf-chips { display: flex; flex-wrap: wrap; gap: 6px; width: 100%; margin-bottom: 6px; }
+.wf-chip {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  border: 1px solid var(--wf-border); border-radius: 999px; padding: 3px 6px 3px 10px;
+  font-size: 12px; color: var(--wf-strong); background: var(--wf-surface);
+}
+.wf-chip-busy { opacity: 0.7; }
+.wf-chip-err { border-color: #e34948; color: #b3261e; }
+.wf-chip-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-chip-why { color: var(--wf-muted); font-size: 11px; }
+.wf-chip-err .wf-chip-why { color: #b3261e; }
+.wf-chip button {
+  border: 0; background: none; cursor: pointer; color: inherit; font-size: 14px;
+  line-height: 1; padding: 0 2px;
+}
+
+.wf-draw { border-top: 1px solid var(--wf-border); padding: 8px; background: var(--wf-panel); }
+/* `touch-action: none` is what makes a finger draw instead of scrolling. */
+.wf-draw-pad {
+  display: block; width: 100%; height: auto; aspect-ratio: 2 / 1; touch-action: none;
+  border: 1px solid var(--wf-border); border-radius: 8px; background: #ffffff; cursor: crosshair;
+}
+.wf-draw-bar { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+.wf-draw-spacer { flex: 1; }
+
+/* ---- typing indicator -------------------------------------------------- */
+/* Dots shown after partial text while the agent keeps working (e.g. a tool call). */
+.wf-working { margin-top: 6px; display: inline-flex; gap: 8px; align-items: center; }
+.wf-status { font-size: 12px; color: var(--wf-muted); }
+.wf-elapsed { font-size: 12px; color: var(--wf-muted); opacity: 0.75; font-variant-numeric: tabular-nums; }
+.wf-typing { display: inline-flex; gap: 4px; align-items: center; padding: 2px 0; }
+.wf-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--wf-muted); opacity: 0.5; animation: wf-bounce 1.2s infinite; }
+.wf-dot:nth-child(2) { animation-delay: 0.15s; }
+.wf-dot:nth-child(3) { animation-delay: 0.3s; }
+@keyframes wf-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-4px); opacity: 1; } }
+
+/* ---- empty state ------------------------------------------------------- */
+.wf-empty { margin: auto; text-align: center; padding: 24px; color: var(--wf-muted); }
+.wf-empty-logo { width: 56px; height: 56px; border-radius: 14px; object-fit: cover; margin-bottom: 12px; }
+.wf-empty-icon {
+  width: 56px; height: 56px; border-radius: 16px; margin: 0 auto 12px;
+  background: color-mix(in srgb, var(--wf-primary) 12%, var(--wf-panel));
+  color: var(--wf-accent); display: flex; align-items: center; justify-content: center;
+}
+.wf-empty-title { font: 600 17px var(--wf-font); color: var(--wf-strong); }
+.wf-empty-sub { font: 400 13.5px var(--wf-font); margin-top: 4px; }
+.wf-connecting { flex: 1; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--wf-muted); font-size: 14px; background: var(--wf-surface); }
+.wf-reload { border: 1px solid var(--wf-border); background: var(--wf-panel); color: var(--wf-accent); cursor: pointer; border-radius: 8px; padding: 4px 12px; font: 600 13px var(--wf-font); }
+.wf-reload:hover { background: var(--wf-surface); }
+.wf-reload:focus-visible { outline: 2px solid var(--wf-accent); outline-offset: 1px; }
+.wf-older { display: flex; justify-content: center; padding: 6px 0 10px; }
+
+/* ---- history list ------------------------------------------------------ */
+.wf-history { flex: 1; overflow-y: auto; background: var(--wf-surface); padding: 8px; display: flex; flex-direction: column; gap: 4px; }
+.wf-hist-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  border: 1px solid transparent; background: var(--wf-panel); border-radius: 12px; padding: 11px 12px;
+  cursor: pointer; font-family: var(--wf-font); transition: border-color 0.12s, box-shadow 0.12s;
+}
+.wf-hist-item:hover { border-color: var(--wf-border); box-shadow: 0 1px 4px rgba(15, 23, 42, 0.06); }
+.wf-hist-active { border-color: var(--wf-accent); }
+.wf-hist-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.wf-hist-title { font-size: 14px; font-weight: 550; color: var(--wf-strong); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wf-hist-meta { font-size: 12px; color: var(--wf-muted); }
+.wf-hist-del {
+  flex-shrink: 0; width: 30px; height: 30px; border-radius: 8px; color: var(--wf-muted);
+  display: flex; align-items: center; justify-content: center; opacity: 0; transition: opacity 0.12s, background 0.12s, color 0.12s;
+}
+.wf-hist-item:hover .wf-hist-del { opacity: 0.8; }
+.wf-hist-del:hover { background: color-mix(in srgb, #ef4444 12%, var(--wf-panel)); color: #ef4444; opacity: 1; }
+
+/* ---- composer ---------------------------------------------------------- */
+.wf-composer {
+  display: flex; align-items: flex-end; gap: 8px;
+  padding: 12px; border-top: 1px solid var(--wf-border); background: var(--wf-panel); flex-shrink: 0;
+}
+.wf-input {
+  flex: 1; border: 1px solid var(--wf-input-border); border-radius: 14px;
+  padding: 11px 14px; font: 14.5px var(--wf-font); resize: none; outline: none;
+  max-height: 140px; line-height: 1.45; color: var(--wf-strong); background: var(--wf-input-bg);
+  position: relative; z-index: 7;
+}
+.wf-input:focus { border-color: var(--wf-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--wf-primary) 14%, transparent); }
+/* Above the resize grip, like .wf-input: a top-anchored panel drops the grip onto
+   one of the composer's two bottom corners, and typing beats resizing there. */
+.wf-send {
+  border: 0; background: var(--wf-send-bg); color: var(--wf-primary-text);
+  background-size: var(--wf-send-zoom);
+  background-position: var(--wf-brand-zoom-pos);
+  position: relative; z-index: 7;
+  width: 42px; height: 42px; border-radius: 12px; cursor: pointer; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center; transition: filter 0.12s, opacity 0.12s;
+}
+.wf-send:hover { filter: brightness(1.06); }
+.wf-send:disabled { opacity: 0.45; cursor: default; }
+.wf-send:focus-visible { outline: 3px solid color-mix(in srgb, var(--wf-primary) 40%, white); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .wf-panel, .wf-launch, .wf-viewport { animation: none; transition: none; scroll-behavior: auto; }
+}
