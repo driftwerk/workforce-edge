@@ -25,7 +25,9 @@ env:
 jobs:
   image:
     name: Build and push the edge image
-    runs-on: ubuntu-latest
+    # Older than the Debian runtime image, so the binary never needs a newer
+    # glibc than the image has.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     environment: dockerhub
     permissions:
