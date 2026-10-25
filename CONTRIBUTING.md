@@ -14,16 +14,13 @@ under.
 - Changes to the shared runtime (agent loop, memory, tools) belong in
   [Workforce](https://github.com/driftwerk/workforce); Edge pins it by revision.
 
-## Contributor Licence Agreement
+## Licence
 
-Workforce Edge is published under the [Elastic License 2.0](LICENSE).
-Contributions are accepted under the [Contributor Licence Agreement](CLA.md),
-which lets the maintainer distribute your contribution under the project's
-licence and under other terms (for example a commercial licence). You keep the
-copyright in your work.
-
-The CLA Assistant bot asks you to sign on your first pull request. A pull
-request can't be merged until the `license/cla` check passes.
+A contribution is licensed under the Elastic License 2.0, like the rest of the
+repository (see the [README](README.md#licence)). By submitting a contribution
+you also grant the licensor a perpetual, worldwide, royalty-free, irrevocable
+licence to use, modify, sublicense and distribute it under any terms, including
+in commercial products and services.
 
 ## Development setup
 

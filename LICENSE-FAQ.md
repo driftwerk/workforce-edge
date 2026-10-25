@@ -35,5 +35,5 @@ service. That is why we call Workforce Edge *source-available*.
 
 ## Contributions
 
-Contributions are accepted under the [Contributor Licence Agreement](CLA.md);
-see [CONTRIBUTING.md](CONTRIBUTING.md).
+Contributions are accepted under the terms in
+[CONTRIBUTING.md](CONTRIBUTING.md#licence).
