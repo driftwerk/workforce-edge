@@ -164,25 +164,7 @@ pub fn bearer_token(headers: &HeaderMap, query_token: Option<&str>) -> Option<St
         .filter(|t| !t.is_empty())
 }
 
-/// The collision-free session owner for a verified customer: `ext:` + the realm
-/// issuer + the subject. Distinct from any internal UUID owner, and unique
-/// across realms, so a customer can only ever address their own sessions.
-pub fn external_owner(issuer: &str, sub: &str) -> String {
-    format!("{CUSTOMER_PREFIX}{issuer}\u{1f}{sub}")
-}
-
-/// What every customer's owner key starts with.
-const CUSTOMER_PREFIX: &str = "ext:";
-
-/// Whether `key` is a customer's owner key, as [`external_owner`] makes it: an
-/// issuer and a subject, neither empty. Lessons, training data and any other
-/// identity the edge keys by have another shape, so erasure that reaches only
-/// these reaches only customers.
-pub fn is_customer_owner(key: &str) -> bool {
-    key.strip_prefix(CUSTOMER_PREFIX)
-        .and_then(|rest| rest.split_once('\u{1f}'))
-        .is_some_and(|(issuer, sub)| !issuer.is_empty() && !sub.is_empty())
-}
+pub use workforce_memory::edge_owner::{external_owner, is_customer_owner};
 
 /// Parse the configured trusted-proxy CIDRs, skipping (with a warning) any that
 /// don't parse so one typo can't silently disable proxy handling.

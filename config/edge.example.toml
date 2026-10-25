@@ -35,6 +35,8 @@ connect_budget_secs = 300
 # The edge's OWN Weaviate — agent memory + the customer-facing training corpus.
 [weaviate]
 url = "http://edge-weaviate.internal:8080"
+# Required: the edge's own class, never the hub's WorkforceMemory.
+collection = "EdgeMemory"
 # api_key = "CHANGE_ME"   # when the instance is authenticated
 connect_budget_secs = 300
 
