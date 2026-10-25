@@ -441,9 +441,59 @@ pub struct WeaviateConfig {
     /// Optional API key, when the instance is authenticated.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// The class the edge's memories are kept in. Required, and never one of
+    /// the hub's (`WorkforceMemory`, or a name the hub derives from it):
+    /// sharing the hub's class put edge customers' memories in the hub's
+    /// stores, where the edge's erasure did not reach their copies.
+    #[serde(default)]
+    pub collection: Option<String>,
     /// Seconds to keep retrying readiness before aborting boot.
     #[serde(default = "default_connect_budget_secs")]
     pub connect_budget_secs: u64,
+}
+
+/// The hub's knots for bge-base, as driftwerk/workforce's `docs/vellev.md`
+/// ("The edge's own memory store") sets them.
+const BGE_KNOTS: &str = "[[0.0, 0.0], [0.72, 0.60], [0.77, 0.65], [0.80, 0.70], [0.83, 0.80], [0.935, 0.92], [0.98, 0.97], [1.0, 1.0]]";
+
+impl VellevConfig {
+    /// `Err` for a bge model with no `score_map`: the edge's recall floors
+    /// were tuned on MiniLM's certainty, and bge's runs high, so without
+    /// the knots every floor would admit nearly everything.
+    pub fn calibrated(&self) -> Result<()> {
+        if self.model.to_ascii_lowercase().contains("bge") && self.score_map.is_empty() {
+            return Err(eyre::eyre!(
+                "[vellev] model {:?} needs a score_map: the edge's recall floors were tuned on MiniLM. Set the hub's knots, as docs/vellev.md says: score_map = {BGE_KNOTS}",
+                self.model
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`Self::score_map`] as the store takes it.
+    pub fn knots(&self) -> Vec<(f32, f32)> {
+        self.score_map.iter().map(|[raw, to]| (*raw, *to)).collect()
+    }
+}
+
+impl WeaviateConfig {
+    /// The edge's own class: named, and not the hub's.
+    pub fn own_collection(&self) -> Result<&str> {
+        let name = self.collection.as_deref().map(str::trim).unwrap_or("");
+        if name.is_empty() {
+            return Err(eyre::eyre!(
+                "[weaviate] collection is required: name a class of the edge's own (for example \"EdgeMemory\"), never the hub's WorkforceMemory"
+            ));
+        }
+        // Weaviate capitalises a class's first letter, so case is compared
+        // loosely; every class the hub keeps memories in starts so.
+        if name.to_ascii_lowercase().starts_with("workforcememory") {
+            return Err(eyre::eyre!(
+                "[weaviate] collection {name:?} is the hub's or named like it; the edge keeps its memories in a class of its own"
+            ));
+        }
+        Ok(name)
+    }
 }
 
 /// The edge's own vellev tenant — the alternative to `[weaviate]`. The node
@@ -464,6 +514,15 @@ pub struct VellevConfig {
     /// How many dimensions `model` produces.
     #[serde(default = "default_vellev_dimensions")]
     pub dimensions: u32,
+    /// What the node puts before a query's text when it embeds it, for a
+    /// model that wants one (bge's); none by default, as MiniLM wants none.
+    #[serde(default)]
+    pub query_prefix: Option<String>,
+    /// Knots `[raw, calibrated]` putting the model's certainty on the scale
+    /// the edge's recall floors (memories, lessons, knowledge) were tuned
+    /// on, MiniLM's; empty leaves scores as the model gives them.
+    #[serde(default)]
+    pub score_map: Vec<[f32; 2]>,
     /// Seconds to keep retrying readiness before aborting boot.
     #[serde(default = "default_connect_budget_secs")]
     pub connect_budget_secs: u64,
@@ -560,8 +619,14 @@ impl EdgeConfig {
     /// both would leave which one holds the corpus to chance.
     pub fn memory_backend(&self) -> Result<MemoryBackend<'_>> {
         match (&self.weaviate, &self.vellev) {
-            (Some(weaviate), None) => Ok(MemoryBackend::Weaviate(weaviate)),
-            (None, Some(vellev)) => Ok(MemoryBackend::Vellev(vellev)),
+            (Some(weaviate), None) => {
+                weaviate.own_collection()?;
+                Ok(MemoryBackend::Weaviate(weaviate))
+            }
+            (None, Some(vellev)) => {
+                vellev.calibrated()?;
+                Ok(MemoryBackend::Vellev(vellev))
+            }
             (None, None) => Err(eyre::eyre!("one of [weaviate] or [vellev] is required")),
             (Some(_), Some(_)) => Err(eyre::eyre!(
                 "[weaviate] and [vellev] are both set; the edge uses exactly one vector store"
@@ -589,6 +654,7 @@ mod tests {
 
             [weaviate]
             url = "http://weaviate:8080"
+            collection = "EdgeMemory"
 
             [llm]
             api_key = "sk-test"
@@ -651,6 +717,104 @@ mod tests {
         assert!(format!("{err:#}").contains("api_key"), "{err:#}");
     }
 
+    /// The edge and the hub once shared Weaviate's `WorkforceMemory` by
+    /// default, so an edge customer's erasure never reached the hub's copies
+    /// (DW-676 (b)). A Weaviate store must name its own collection.
+    #[test]
+    fn a_weaviate_store_must_name_a_collection_of_its_own() {
+        let unnamed = config_from(&format!(
+            "{WITHOUT_VECTOR_STORE}\n[weaviate]\nurl = \"http://weaviate:8080\""
+        ))
+        .unwrap_err();
+        assert!(
+            format!("{unnamed:#}").contains("[weaviate] collection"),
+            "{unnamed:#}"
+        );
+        for refused in [
+            "",
+            "  ",
+            "WorkforceMemory",
+            "workforceMemory",
+            "WorkforceMemory_bge_base_en_v1_5",
+            "WorkforceMemorySwitch",
+        ] {
+            let err = config_from(&format!(
+                "{WITHOUT_VECTOR_STORE}\n[weaviate]\nurl = \"http://weaviate:8080\"\ncollection = {refused:?}"
+            ))
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("[weaviate] collection"),
+                "{refused:?} must be refused: {err:#}"
+            );
+        }
+        let own = config_from(&format!(
+            "{WITHOUT_VECTOR_STORE}\n[weaviate]\nurl = \"http://weaviate:8080\"\ncollection = \"EdgeMemory\""
+        ))
+        .unwrap();
+        let MemoryBackend::Weaviate(weaviate) = own.memory_backend().unwrap() else {
+            panic!("a [weaviate] section names Weaviate");
+        };
+        assert_eq!(weaviate.collection.as_deref(), Some("EdgeMemory"));
+    }
+
+    /// Recall floors were tuned on MiniLM's certainty; a `score_map` puts
+    /// another model's on that scale, as the hub's does for bge.
+    #[test]
+    fn a_vellev_score_map_is_read_and_empty_by_default() {
+        let vellev = |extra: &str| {
+            config_from(&format!(
+                "{WITHOUT_VECTOR_STORE}\n[vellev]\nurl = \"http://vellev:18080\"\napi_key = \"k\"\ntenant = \"acme\"\n{extra}"
+            ))
+            .unwrap()
+        };
+        let plain = vellev("");
+        let MemoryBackend::Vellev(plain) = plain.memory_backend().unwrap() else {
+            panic!("vellev");
+        };
+        assert!(plain.score_map.is_empty());
+        let mapped = vellev("score_map = [[0.0, 0.0], [0.72, 0.6], [1.0, 1.0]]");
+        let MemoryBackend::Vellev(mapped) = mapped.memory_backend().unwrap() else {
+            panic!("vellev");
+        };
+        assert_eq!(mapped.score_map, vec![[0.0, 0.0], [0.72, 0.6], [1.0, 1.0]]);
+        assert_eq!(mapped.knots(), vec![(0.0, 0.0), (0.72, 0.6), (1.0, 1.0)]);
+    }
+
+    /// The edge never runs bge uncalibrated by accident.
+    #[test]
+    fn a_bge_model_without_a_score_map_is_refused() {
+        let vellev = |extra: &str| {
+            config_from(&format!(
+                "{WITHOUT_VECTOR_STORE}\n[vellev]\nurl = \"http://vellev:18080\"\napi_key = \"k\"\ntenant = \"acme\"\nmodel = \"BAAI/bge-base-en-v1.5\"\ndimensions = 768\n{extra}"
+            ))
+        };
+        let err = vellev("").unwrap_err();
+        let said = format!("{err:#}");
+        assert!(said.contains("needs a score_map"), "{said}");
+        assert!(said.contains("[0.72, 0.60]"), "names the knots: {said}");
+        vellev("score_map = [[0.0, 0.0], [0.72, 0.6], [1.0, 1.0]]").unwrap();
+    }
+
+    #[test]
+    fn a_vellev_query_prefix_is_read_and_absent_by_default() {
+        let vellev = |extra: &str| {
+            config_from(&format!(
+                "{WITHOUT_VECTOR_STORE}\n[vellev]\nurl = \"http://vellev:18080\"\napi_key = \"k\"\ntenant = \"acme\"\n{extra}"
+            ))
+            .unwrap()
+        };
+        let without = vellev("");
+        let MemoryBackend::Vellev(plain) = without.memory_backend().unwrap() else {
+            panic!("vellev");
+        };
+        assert_eq!(plain.query_prefix, None);
+        let with = vellev("query_prefix = \"q: \"");
+        let MemoryBackend::Vellev(prefixed) = with.memory_backend().unwrap() else {
+            panic!("vellev");
+        };
+        assert_eq!(prefixed.query_prefix.as_deref(), Some("q: "));
+    }
+
     #[test]
     fn exactly_one_vector_store_is_required() {
         let neither = config_from(WITHOUT_VECTOR_STORE).unwrap_err();
@@ -679,6 +843,7 @@ mod tests {
 
             [weaviate]
             url = "http://weaviate:8080"
+            collection = "EdgeMemory"
 
             [llm]
             api_key = "sk-test"
@@ -739,6 +904,7 @@ url = "${EDGE_TEST_PG_URL}"
 
 [weaviate]
 url = "http://weaviate:8080"
+collection = "EdgeMemory"
 
 [llm]
 provider = "bedrock"

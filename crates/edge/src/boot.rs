@@ -291,7 +291,12 @@ impl SharedInfra {
             )
         })?;
         let store = VellevStore::new(&vellev.url, &key, tenant.as_str(), DEFAULT_COLLECTION)?
-            .with_local_model(&vellev.model, vellev.dimensions, None);
+            .with_local_model(
+                &vellev.model,
+                vellev.dimensions,
+                vellev.query_prefix.as_deref(),
+            )
+            .with_score_map(vellev.knots());
         ensure_collection("edge-vellev", vellev.connect_budget_secs, store).await
     }
 
@@ -422,6 +427,8 @@ impl SharedInfra {
             tenant: TenantId::DEFAULT.to_string(),
             model: "Qdrant/all-MiniLM-L6-v2-onnx".to_string(),
             dimensions: 384,
+            query_prefix: None,
+            score_map: Vec::new(),
             connect_budget_secs: 1,
         };
         self.vellev_admin = Some(vellev_admin_client(&cfg).expect("a mock node URL"));
@@ -685,7 +692,8 @@ async fn connect_postgres(config: &EdgeConfig) -> Result<(PostgresPool, bool)> {
 async fn connect_memory(config: &EdgeConfig) -> Result<Arc<dyn MemoryStore>> {
     match config.memory_backend()? {
         MemoryBackend::Weaviate(weaviate) => {
-            let store = WeaviateStore::new(weaviate.url.clone(), weaviate.api_key.as_deref());
+            let store = WeaviateStore::new(weaviate.url.clone(), weaviate.api_key.as_deref())
+                .in_collection(weaviate.own_collection()?);
             ensure_collection("edge-weaviate", weaviate.connect_budget_secs, store).await
         }
         MemoryBackend::Vellev(vellev) => {
@@ -695,7 +703,12 @@ async fn connect_memory(config: &EdgeConfig) -> Result<Arc<dyn MemoryStore>> {
                 &vellev.tenant,
                 DEFAULT_COLLECTION,
             )?
-            .with_local_model(&vellev.model, vellev.dimensions, None);
+            .with_local_model(
+                &vellev.model,
+                vellev.dimensions,
+                vellev.query_prefix.as_deref(),
+            )
+            .with_score_map(vellev.knots());
             ensure_collection("edge-vellev", vellev.connect_budget_secs, store).await
         }
     }

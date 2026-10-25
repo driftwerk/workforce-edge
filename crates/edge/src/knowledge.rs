@@ -21,8 +21,7 @@ use workforce_memory::types::{Memory, MemoryFilter, MemoryLayer, MemorySource, V
 
 use crate::tenant::{PlanUsage, TenantId, TenantPool};
 
-/// The fixed identity every knowledge chunk is stored and recalled under.
-pub(crate) const KNOWLEDGE_IDENTITY: &str = "edge:knowledge";
+pub(crate) use workforce_memory::edge_owner::KNOWLEDGE_IDENTITY;
 
 /// Chunking target: pack paragraphs up to this many chars per chunk.
 const CHUNK_CHARS: usize = 1200;
