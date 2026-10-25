@@ -1,0 +1,10 @@
+title = "workforce-edge"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Tests: fabricated session secrets, platform tokens and a test-only RSA keypair"
+paths = [
+  '''^crates/edge/src/(keycloak|tenant|settings|platform|server)\.rs$''',
+]
