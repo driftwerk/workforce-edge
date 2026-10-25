@@ -26,9 +26,7 @@ use workforce_memory::types::{Memory, MemoryFilter, MemoryId, MemorySource};
 
 use crate::analytics::{UsageMeter, UsagePurpose};
 
-/// The fixed identity scope every edge lesson is written and recalled under.
-/// One shared lesson book per agent — never a customer's identity.
-pub(crate) const LESSON_IDENTITY: &str = "edge:lessons";
+pub(crate) use workforce_memory::edge_owner::LESSON_IDENTITY;
 
 /// Cap on the admin lesson list.
 const LESSON_LIST_MAX: usize = 500;
