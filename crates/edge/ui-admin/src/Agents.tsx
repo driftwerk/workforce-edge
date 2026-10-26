@@ -404,10 +404,13 @@ function McpServerList({
   rows,
   onChange,
   readOnly,
+  canAdd,
 }: {
   rows: McpServerRow[];
   onChange: (rows: McpServerRow[]) => void;
   readOnly: boolean;
+  /** Additional servers need the primary; removing them never does. */
+  canAdd: boolean;
 }) {
   const [surveys, setSurveys] = useState<Record<number, api.McpSurvey | string>>({});
   const patch = (i: number, p: Partial<McpServerRow>) => onChange(rows.map((r, j) => (j === i ? { ...r, ...p } : r)));
@@ -514,7 +517,13 @@ function McpServerList({
         );
       })}
       {!readOnly && (
-        <button className="btn-sm ghost" type="button" onClick={() => onChange([...rows, emptyServerRow()])}>
+        <button
+          className="btn-sm ghost"
+          type="button"
+          disabled={!canAdd}
+          title={canAdd ? undefined : "set the primary MCP URL first"}
+          onClick={() => onChange([...rows, emptyServerRow()])}
+        >
           + Add server
         </button>
       )}
@@ -935,7 +944,8 @@ function AgentEditor({
           <McpServerList
             rows={integ.mcp_servers}
             onChange={(rows) => setInt("mcp_servers", rows)}
-            readOnly={readOnly || !integ.mcp.url.trim()}
+            readOnly={readOnly}
+            canAdd={!!integ.mcp.url.trim()}
           />
           <label>
             Permissions URL
