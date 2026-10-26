@@ -60,8 +60,10 @@ Every label value comes from configuration or a fixed set, so the number of
 series is bounded by the config. Labels never carry a customer, a token, a
 tool's arguments or a URL.
 
-- `agent` and `server` are ids from the agent config. The primary server is
-  `default`.
+- `tenant`, `agent` and `server` are ids from the config. Every series except
+  `edge_mcp_config_refusals_total` also carries `tenant`, because agent ids are
+  unique only within a tenant. A single-tenant install's tenant and the
+  primary server are both `default`.
 - `tool` is an allowlisted name.
 - `audience` is a configured audience, or `none` for an exchange that asks for
   no audience.

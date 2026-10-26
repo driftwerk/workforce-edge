@@ -4,10 +4,10 @@
 //! The recorder is the `metrics` facade's global one, installed with
 //! `metrics-exporter-prometheus` exactly as the core crates install theirs, and
 //! only when `[metrics]` is enabled — so an install that never asks for
-//! metrics records nothing. Every label value comes from configuration (agent
-//! and server ids, configured audiences, allowlisted tool names) or a fixed
-//! set of outcomes, never from a customer, a token, tool arguments or a URL,
-//! which keeps the series count bounded by the config.
+//! metrics records nothing. Every label value comes from configuration
+//! (tenant, agent and server ids, configured audiences, allowlisted tool
+//! names) or a fixed set of outcomes, never from a customer, a token, tool
+//! arguments or a URL, which keeps the series count bounded by the config.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -68,6 +68,31 @@ pub fn install_recorder() {
             let _ = HANDLE.set(handle);
         }
         Err(e) => tracing::warn!(error = %e, "failed to install the Prometheus recorder"),
+    }
+}
+
+/// Whose MCP traffic a metric counts. Agent ids are unique only within a
+/// tenant, so both label every series an agent records.
+#[derive(Debug, Clone, Default)]
+pub struct AgentScope {
+    tenant: Arc<str>,
+    agent: Arc<str>,
+}
+
+impl AgentScope {
+    pub fn new(tenant: &str, agent: &str) -> Self {
+        Self {
+            tenant: tenant.into(),
+            agent: agent.into(),
+        }
+    }
+
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    fn labels(&self) -> (String, String) {
+        (self.tenant.to_string(), self.agent.to_string())
     }
 }
 
@@ -198,45 +223,50 @@ impl CallOutcome {
 }
 
 pub(crate) fn discovery(
-    agent: &str,
+    scope: &AgentScope,
     server: &str,
     phase: DiscoveryPhase,
     outcome: &'static str,
     elapsed: Duration,
 ) {
-    let (agent, server, phase) = (agent.to_string(), server.to_string(), phase.as_str());
-    metrics::counter!("edge_mcp_discovery_total", "agent" => agent.clone(), "server" => server.clone(), "phase" => phase, "outcome" => outcome)
+    let (tenant, agent) = scope.labels();
+    let (server, phase) = (server.to_string(), phase.as_str());
+    metrics::counter!("edge_mcp_discovery_total", "tenant" => tenant.clone(), "agent" => agent.clone(), "server" => server.clone(), "phase" => phase, "outcome" => outcome)
         .increment(1);
-    metrics::histogram!("edge_mcp_discovery_duration_seconds", "agent" => agent, "server" => server, "phase" => phase)
+    metrics::histogram!("edge_mcp_discovery_duration_seconds", "tenant" => tenant, "agent" => agent, "server" => server, "phase" => phase)
         .record(elapsed.as_secs_f64());
 }
 
-pub(crate) fn tools_cache(agent: &str, server: &str, result: CacheResult) {
-    metrics::counter!("edge_mcp_tools_cache_total", "agent" => agent.to_string(), "server" => server.to_string(), "result" => result.as_str())
+pub(crate) fn tools_cache(scope: &AgentScope, server: &str, result: CacheResult) {
+    let (tenant, agent) = scope.labels();
+    metrics::counter!("edge_mcp_tools_cache_total", "tenant" => tenant, "agent" => agent, "server" => server.to_string(), "result" => result.as_str())
         .increment(1);
 }
 
 pub(crate) fn tool_call(
-    agent: &str,
+    scope: &AgentScope,
     server: &str,
     tool: &str,
     outcome: CallOutcome,
     elapsed: Duration,
 ) {
-    let (agent, server, tool) = (agent.to_string(), server.to_string(), tool.to_string());
-    metrics::counter!("edge_mcp_tool_calls_total", "agent" => agent.clone(), "server" => server.clone(), "tool" => tool.clone(), "outcome" => outcome.as_str())
+    let (tenant, agent) = scope.labels();
+    let (server, tool) = (server.to_string(), tool.to_string());
+    metrics::counter!("edge_mcp_tool_calls_total", "tenant" => tenant.clone(), "agent" => agent.clone(), "server" => server.clone(), "tool" => tool.clone(), "outcome" => outcome.as_str())
         .increment(1);
-    metrics::histogram!("edge_mcp_tool_call_duration_seconds", "agent" => agent, "server" => server, "tool" => tool)
+    metrics::histogram!("edge_mcp_tool_call_duration_seconds", "tenant" => tenant, "agent" => agent, "server" => server, "tool" => tool)
         .record(elapsed.as_secs_f64());
 }
 
-pub(crate) fn server_skipped(agent: &str, server: &str) {
-    metrics::counter!("edge_mcp_server_skipped_total", "agent" => agent.to_string(), "server" => server.to_string())
+pub(crate) fn server_skipped(scope: &AgentScope, server: &str) {
+    let (tenant, agent) = scope.labels();
+    metrics::counter!("edge_mcp_server_skipped_total", "tenant" => tenant, "agent" => agent, "server" => server.to_string())
         .increment(1);
 }
 
-pub(crate) fn skip_window_entered(agent: &str, server: &str) {
-    metrics::counter!("edge_mcp_skip_window_entered_total", "agent" => agent.to_string(), "server" => server.to_string())
+pub(crate) fn skip_window_entered(scope: &AgentScope, server: &str) {
+    let (tenant, agent) = scope.labels();
+    metrics::counter!("edge_mcp_skip_window_entered_total", "tenant" => tenant, "agent" => agent, "server" => server.to_string())
         .increment(1);
 }
 
@@ -247,15 +277,16 @@ fn audience_label(audience: Option<&str>) -> String {
 }
 
 pub(crate) fn token_exchange(
-    agent: &str,
+    scope: &AgentScope,
     audience: Option<&str>,
     outcome: &'static str,
     elapsed: Duration,
 ) {
-    let (agent, audience) = (agent.to_string(), audience_label(audience));
-    metrics::counter!("edge_mcp_token_exchanges_total", "agent" => agent.clone(), "audience" => audience.clone(), "outcome" => outcome)
+    let (tenant, agent) = scope.labels();
+    let audience = audience_label(audience);
+    metrics::counter!("edge_mcp_token_exchanges_total", "tenant" => tenant.clone(), "agent" => agent.clone(), "audience" => audience.clone(), "outcome" => outcome)
         .increment(1);
-    metrics::histogram!("edge_mcp_token_exchange_duration_seconds", "agent" => agent, "audience" => audience)
+    metrics::histogram!("edge_mcp_token_exchange_duration_seconds", "tenant" => tenant, "agent" => agent, "audience" => audience)
         .record(elapsed.as_secs_f64());
 }
 
@@ -298,7 +329,7 @@ pub(crate) mod tests {
     /// The label keys any `edge_mcp_*` metric may carry: none of them can
     /// hold a customer, a token, a tool's arguments or a URL.
     pub(crate) const BOUNDED_LABELS: &[&str] = &[
-        "agent", "server", "phase", "outcome", "result", "tool", "audience", "reason",
+        "tenant", "agent", "server", "phase", "outcome", "result", "tool", "audience", "reason",
     ];
 
     pub(crate) fn assert_bounded(metrics: &BTreeMap<String, u64>) {
@@ -351,45 +382,46 @@ pub(crate) mod tests {
     fn instruments_carry_only_bounded_labels() {
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
+        let scope = AgentScope::new("acme", "acme-help");
         metrics::with_local_recorder(&recorder, || {
             discovery(
-                "acme-help",
+                &scope,
                 "docs",
                 DiscoveryPhase::Startup,
                 "ok",
                 Duration::from_millis(5),
             );
-            tools_cache("acme-help", "docs", CacheResult::Hit);
-            tools_cache("acme-help", "docs", CacheResult::Hit);
+            tools_cache(&scope, "docs", CacheResult::Hit);
+            tools_cache(&scope, "docs", CacheResult::Hit);
             tool_call(
-                "acme-help",
+                &scope,
                 "docs",
                 "docs.search",
                 CallOutcome::ToolError,
                 Duration::from_millis(5),
             );
-            server_skipped("acme-help", "docs");
-            skip_window_entered("acme-help", "docs");
-            token_exchange("acme-help", None, "ok", Duration::from_millis(5));
+            server_skipped(&scope, "docs");
+            skip_window_entered(&scope, "docs");
+            token_exchange(&scope, None, "ok", Duration::from_millis(5));
             config_refused("name_collision");
         });
         let metrics = recorded(&snapshotter);
         assert_bounded(&metrics);
         for expected in [
-            "edge_mcp_discovery_total{agent=acme-help,outcome=ok,phase=startup,server=docs}",
-            "edge_mcp_discovery_duration_seconds{agent=acme-help,phase=startup,server=docs}",
-            "edge_mcp_tool_calls_total{agent=acme-help,outcome=tool_error,server=docs,tool=docs.search}",
-            "edge_mcp_tool_call_duration_seconds{agent=acme-help,server=docs,tool=docs.search}",
-            "edge_mcp_server_skipped_total{agent=acme-help,server=docs}",
-            "edge_mcp_skip_window_entered_total{agent=acme-help,server=docs}",
-            "edge_mcp_token_exchanges_total{agent=acme-help,audience=none,outcome=ok}",
-            "edge_mcp_token_exchange_duration_seconds{agent=acme-help,audience=none}",
+            "edge_mcp_discovery_total{agent=acme-help,outcome=ok,phase=startup,server=docs,tenant=acme}",
+            "edge_mcp_discovery_duration_seconds{agent=acme-help,phase=startup,server=docs,tenant=acme}",
+            "edge_mcp_tool_calls_total{agent=acme-help,outcome=tool_error,server=docs,tenant=acme,tool=docs.search}",
+            "edge_mcp_tool_call_duration_seconds{agent=acme-help,server=docs,tenant=acme,tool=docs.search}",
+            "edge_mcp_server_skipped_total{agent=acme-help,server=docs,tenant=acme}",
+            "edge_mcp_skip_window_entered_total{agent=acme-help,server=docs,tenant=acme}",
+            "edge_mcp_token_exchanges_total{agent=acme-help,audience=none,outcome=ok,tenant=acme}",
+            "edge_mcp_token_exchange_duration_seconds{agent=acme-help,audience=none,tenant=acme}",
             "edge_mcp_config_refusals_total{reason=name_collision}",
         ] {
             assert_eq!(metrics.get(expected), Some(&1), "{expected} in {metrics:?}");
         }
         assert_eq!(
-            metrics.get("edge_mcp_tools_cache_total{agent=acme-help,result=hit,server=docs}"),
+            metrics.get("edge_mcp_tools_cache_total{agent=acme-help,result=hit,server=docs,tenant=acme}"),
             Some(&2),
             "a counter accumulates"
         );
