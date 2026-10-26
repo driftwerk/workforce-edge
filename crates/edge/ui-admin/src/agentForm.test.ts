@@ -2,15 +2,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { importGit, UnresolvedPlaceholders, type Agent } from "./api";
 import {
-  concreteTools,
   credentialField,
   describeImport,
+  discoverRequest,
   emptyServerRow,
   exposedName,
+  hasStoredCredential,
   importRequest,
   integrationEdit,
   integrationForm,
   mcpServerRows,
+  spillSkipChoices,
   toggleName,
   withUnresolved,
   type IntegrationForm,
@@ -90,7 +92,6 @@ describe("integrationEdit", () => {
     expect(f.mcp.url).toBe("https://mcp.acme.test/mcp");
     expect(f.mcp.credential).toBe("");
     expect(f.mcp.clear_credential).toBe(false);
-    expect(f.mcp.has_credential).toBe(true);
     expect(f.mcp.required).toBe(true);
     expect(f.permissions_ttl).toBe("60");
     expect(f.tool_grants).toEqual([
@@ -186,14 +187,23 @@ describe("integrationEdit", () => {
     expect(integrationEdit({ ...integrationForm(agent), permissions_ttl: "0" }).permissions?.cache_ttl_secs).toBeNull();
   });
 
-  it("offers every server's exact names, not globs, to the spill-skip picker", () => {
-    expect(
-      concreteTools(
-        agent.allowed_tools,
-        [{ source: "host_hint", requires: "x", tools: "acme.item_transition acme.list_orders" }],
-        mcpServerRows(agent),
-      ),
-    ).toEqual(["acme.list_orders", "acme.item_transition", "docs.search", "docs.edit_page"]);
+  it("offers every server's exact names, not globs, and what is already picked, to the spill-skip picker", () => {
+    const f: IntegrationForm = {
+      ...integrationForm(agent),
+      tool_grants: [{ source: "host_hint", requires: "x", tools: "acme.item_transition acme.list_orders" }],
+    };
+    expect(spillSkipChoices(agent.allowed_tools, f)).toEqual([
+      "acme.list_orders",
+      "acme.item_transition",
+      "docs.search",
+      "docs.edit_page",
+      "acme.reports.signed_urls",
+    ]);
+  });
+
+  it("keeps a picked tool on offer after the server naming it is removed, so it can be unticked", () => {
+    const f = { ...integrationForm(agent), mcp_servers: [], spill_skip_tools: ["docs.search"] };
+    expect(spillSkipChoices([], f)).toEqual(["acme.item_transition", "docs.search"]);
   });
 });
 
@@ -205,7 +215,6 @@ describe("additional MCP servers", () => {
         url: "https://docs-mcp.acme.test/mcp",
         credential: "",
         clear_credential: false,
-        has_credential: true,
         auth: "exchanged",
         audience: "docs-mcp",
         required: false,
@@ -235,6 +244,29 @@ describe("additional MCP servers", () => {
     expect(body.mcp_servers[1]).toMatchObject({ url: "", tool_prefix: null, allowed_tools: [], required: false });
     const cleared = integrationEdit({ ...f, mcp_servers: [{ ...docs, clear_credential: true }] });
     expect(cleared.mcp_servers[0].discovery_credential).toBe("");
+  });
+
+  it("tells which ids keep a stored credential, as the server matches them by id", () => {
+    expect(hasStoredCredential(agent, "docs")).toBe(true);
+    expect(hasStoredCredential(agent, " docs ")).toBe(true);
+    expect(hasStoredCredential(agent, "docs-renamed")).toBe(false);
+    expect(hasStoredCredential(undefined, "docs")).toBe(false);
+    const readded = { ...emptyServerRow(), id: "docs", url: "https://docs-mcp.acme.test/v2" };
+    expect(hasStoredCredential(agent, readded.id)).toBe(true);
+    const [sent] = integrationEdit({ ...integrationForm(agent), mcp_servers: [readded] }).mcp_servers;
+    expect("discovery_credential" in sent).toBe(false);
+  });
+
+  it("probes discovery with only a typed credential", () => {
+    const [docs] = mcpServerRows(agent);
+    expect(discoverRequest(docs)).toEqual({ url: "https://docs-mcp.acme.test/mcp" });
+    expect(discoverRequest({ ...docs, credential: " svc " })).toEqual({
+      url: "https://docs-mcp.acme.test/mcp",
+      discovery_credential: "svc",
+    });
+    expect(discoverRequest({ ...docs, credential: "svc", clear_credential: true })).toEqual({
+      url: "https://docs-mcp.acme.test/mcp",
+    });
   });
 
   it("always sends the list, so removing every row removes them all", () => {

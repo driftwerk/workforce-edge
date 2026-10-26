@@ -2,13 +2,15 @@ import { useEffect, useState } from "react";
 
 import * as api from "./api";
 import {
-  concreteTools,
+  discoverRequest,
   emptyServerRow,
   exposedName,
   GRANT_SOURCES,
+  hasStoredCredential,
   integrationEdit,
   integrationForm,
   names,
+  spillSkipChoices,
   toggleName,
   type GrantRow,
   type IntegrationForm,
@@ -268,10 +270,16 @@ function GrantRows({
               </option>
             ))}
           </select>
-          <input value={g.requires} placeholder="items:edit" onChange={(e) => patch(i, { requires: e.target.value })} />
+          <input
+            value={g.requires}
+            disabled={readOnly}
+            placeholder="items:edit"
+            onChange={(e) => patch(i, { requires: e.target.value })}
+          />
           <input
             className="mono-area"
             value={g.tools}
+            disabled={readOnly}
             placeholder="tools unlocked, space-separated"
             onChange={(e) => patch(i, { tools: e.target.value })}
           />
@@ -301,12 +309,15 @@ function GrantRows({
 function McpConnectionFields({
   value,
   onChange,
+  hasCredential,
   readOnly,
   urlLabel,
   urlHint,
 }: {
   value: McpConnectionRow;
   onChange: (value: McpConnectionRow) => void;
+  /** Whether a save keeps a stored credential — all the editor is told. */
+  hasCredential: boolean;
   readOnly: boolean;
   urlLabel: string;
   urlHint: string;
@@ -326,19 +337,20 @@ function McpConnectionFields({
       </label>
       <div>
         <div className="op-add" style={{ margin: 0 }}>
-          <span className={`pill ${value.has_credential ? "pill-domain" : "pill-neutral"}`}>
-            {value.has_credential ? "set" : "not set"}
+          <span className={`pill ${hasCredential ? "pill-domain" : "pill-neutral"}`}>
+            {hasCredential ? "set" : "not set"}
           </span>
           <input
             type="password"
             autoComplete="off"
+            aria-label="Discovery credential"
             value={value.credential}
             disabled={off || value.clear_credential}
-            placeholder={value.has_credential ? "Replace on save" : "Set on save"}
+            placeholder={hasCredential ? "Replace on save" : "Set on save"}
             onChange={(e) => set("credential", e.target.value)}
           />
         </div>
-        {value.has_credential && (
+        {hasCredential && (
           <label className="check" style={{ marginTop: 8 }}>
             <input
               type="checkbox"
@@ -357,6 +369,7 @@ function McpConnectionFields({
       <div className="op-add" style={{ margin: 0 }}>
         <select
           className="select"
+          aria-label="Customer token"
           value={value.auth}
           disabled={off}
           onChange={(e) => set("auth", e.target.value as api.McpAuth)}
@@ -365,6 +378,7 @@ function McpConnectionFields({
           <option value="forwarded">Forwarded</option>
         </select>
         <input
+          aria-label="Audience"
           value={value.audience}
           disabled={off || value.auth !== "exchanged"}
           placeholder="audience (blank = the install's)"
@@ -390,6 +404,7 @@ function McpConnectionFields({
           min={0}
           value={value.unavailable_skip_secs}
           disabled={off || value.required}
+          aria-label="Skip window in seconds"
           title="seconds a timed-out server sits out; 0 never skips"
           onChange={(e) => set("unavailable_skip_secs", e.target.value)}
         />
@@ -403,27 +418,35 @@ function McpConnectionFields({
 function McpServerList({
   rows,
   onChange,
+  hasCredential,
   readOnly,
   canAdd,
 }: {
   rows: McpServerRow[];
   onChange: (rows: McpServerRow[]) => void;
+  hasCredential: (id: string) => boolean;
   readOnly: boolean;
   /** Additional servers need the primary; removing them never does. */
   canAdd: boolean;
 }) {
-  const [surveys, setSurveys] = useState<Record<number, api.McpSurvey | string>>({});
+  /** Each row's last discovery: what it found, or why it failed. */
+  const [surveys, setSurveys] = useState<(api.McpSurvey | string | undefined)[]>([]);
+  const [discovering, setDiscovering] = useState<number | null>(null);
+  const setSurvey = (i: number, survey: api.McpSurvey | string | undefined) =>
+    setSurveys((s) => Object.assign([...s], { [i]: survey }));
   const patch = (i: number, p: Partial<McpServerRow>) => onChange(rows.map((r, j) => (j === i ? { ...r, ...p } : r)));
+  const remove = (i: number) => {
+    setSurveys((s) => s.filter((_, j) => j !== i));
+    onChange(rows.filter((_, j) => j !== i));
+  };
   const discover = async (i: number) => {
-    const row = rows[i];
+    setDiscovering(i);
     try {
-      const survey = await api.discoverMcp({
-        url: row.url.trim(),
-        ...(row.credential.trim() ? { discovery_credential: row.credential.trim() } : {}),
-      });
-      setSurveys((s) => ({ ...s, [i]: survey }));
+      setSurvey(i, await api.discoverMcp(discoverRequest(rows[i])));
     } catch (err) {
-      setSurveys((s) => ({ ...s, [i]: err instanceof Error ? err.message : String(err) }));
+      setSurvey(i, err instanceof Error ? err.message : String(err));
+    } finally {
+      setDiscovering(null);
     }
   };
   return (
@@ -436,10 +459,19 @@ function McpServerList({
               <label>
                 Id<span className="hint">names the server in logs and errors</span>
               </label>
-              <input value={row.id} disabled={readOnly} placeholder="docs" onChange={(e) => patch(i, { id: e.target.value })} />
+              <input
+                value={row.id}
+                disabled={readOnly}
+                placeholder="docs"
+                onChange={(e) => patch(i, { id: e.target.value, clear_credential: false })}
+              />
               <McpConnectionFields
                 value={row}
-                onChange={(c) => patch(i, c)}
+                onChange={(c) => {
+                  if (c.url !== row.url) setSurvey(i, undefined);
+                  patch(i, c);
+                }}
+                hasCredential={hasCredential(row.id)}
                 readOnly={readOnly}
                 urlLabel="MCP URL"
                 urlHint="where this server's tools live"
@@ -468,32 +500,41 @@ function McpServerList({
                   <button
                     className="btn-sm ghost"
                     type="button"
-                    disabled={!row.url.trim()}
+                    disabled={!row.url.trim() || discovering !== null}
+                    title="lists the tools using only a credential typed above"
                     onClick={() => void discover(i)}
                   >
-                    Discover tools
+                    {discovering === i ? "Discovering…" : "Discover tools"}
                   </button>
                 )}
                 {typeof survey === "string" && <p className="err">{survey}</p>}
                 {survey && typeof survey !== "string" && (
-                  <div className="tool-list" style={{ marginTop: 8 }}>
-                    {survey.tools.map((t) => {
-                      const name = exposedName(row.tool_prefix, t.name);
-                      return (
-                        <label key={t.name} className="tool-row">
-                          <input
-                            type="checkbox"
-                            checked={names(row.allowed_tools).includes(name)}
-                            onChange={(e) => patch(i, { allowed_tools: toggleName(row.allowed_tools, name, e.target.checked) })}
-                          />
-                          <span>
-                            <span className="tool-name">{name}</span>
-                            {t.description && <div className="tool-desc">{t.description}</div>}
-                          </span>
-                        </label>
-                      );
-                    })}
-                  </div>
+                  <>
+                    {survey.tools.length === 0 && <p className="muted">The server lists no tools.</p>}
+                    {survey.truncated && (
+                      <p className="muted">The list stopped at the cap, so it is a floor, not the whole surface.</p>
+                    )}
+                    <div className="tool-list" style={{ marginTop: 8 }}>
+                      {survey.tools.map((t) => {
+                        const name = exposedName(row.tool_prefix, t.name);
+                        return (
+                          <label key={t.name} className="tool-row">
+                            <input
+                              type="checkbox"
+                              checked={names(row.allowed_tools).includes(name)}
+                              onChange={(e) =>
+                                patch(i, { allowed_tools: toggleName(row.allowed_tools, name, e.target.checked) })
+                              }
+                            />
+                            <span>
+                              <span className="tool-name">{name}</span>
+                              {t.description && <div className="tool-desc">{t.description}</div>}
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </>
                 )}
               </div>
               <label>
@@ -502,14 +543,7 @@ function McpServerList({
               <GrantRows rows={row.tool_grants} onChange={(g) => patch(i, { tool_grants: g })} readOnly={readOnly} />
             </div>
             {!readOnly && (
-              <button
-                className="btn-sm ghost"
-                type="button"
-                onClick={() => {
-                  setSurveys({});
-                  onChange(rows.filter((_, j) => j !== i));
-                }}
-              >
+              <button className="btn-sm ghost" type="button" disabled={discovering !== null} onClick={() => remove(i)}>
                 Remove server
               </button>
             )}
@@ -574,7 +608,7 @@ function AgentEditor({
   const [integ, setInteg] = useState<IntegrationForm>(() => integrationForm(agent));
   const setInt = <K extends keyof IntegrationForm>(k: K, v: IntegrationForm[K]) =>
     setInteg((p) => ({ ...p, [k]: v }));
-  const pickable = concreteTools(lines(tools), integ.tool_grants, integ.mcp_servers);
+  const pickable = spillSkipChoices(lines(tools), integ);
   const [b, setB] = useState<api.Branding>({ ...(agent?.branding ?? {}) });
   // Git-managed installs: everything but Appearance is read-only (edit in git).
   const readOnly = api.isGitManaged() && !isNew;
@@ -933,6 +967,7 @@ function AgentEditor({
           <McpConnectionFields
             value={integ.mcp}
             onChange={(mcp) => setInt("mcp", mcp)}
+            hasCredential={agent?.mcp_settings?.has_discovery_credential ?? false}
             readOnly={readOnly}
             urlLabel="Company MCP URL"
             urlHint="the primary server the agent's tools live on; blank = pure chat"
@@ -944,6 +979,7 @@ function AgentEditor({
           <McpServerList
             rows={integ.mcp_servers}
             onChange={(rows) => setInt("mcp_servers", rows)}
+            hasCredential={(id) => hasStoredCredential(agent, id)}
             readOnly={readOnly}
             canAdd={!!integ.mcp.url.trim()}
           />

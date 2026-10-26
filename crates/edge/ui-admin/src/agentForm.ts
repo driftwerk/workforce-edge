@@ -5,6 +5,7 @@ import type {
   GitImportRequest,
   GrantSource,
   McpAuth,
+  McpDiscoverRequest,
   McpEdit,
   McpServer,
   McpServerEdit,
@@ -54,8 +55,6 @@ export interface McpConnectionRow {
   credential: string;
   /** The operator asked to clear the stored credential on save. */
   clear_credential: boolean;
-  /** Whether a credential is stored — the only thing the editor is told. */
-  has_credential: boolean;
   auth: McpAuth;
   audience: string;
   required: boolean;
@@ -100,7 +99,6 @@ function connectionRow(server: McpServer | null | undefined, requiredByDefault: 
     url: server?.url ?? "",
     credential: "",
     clear_credential: false,
-    has_credential: server?.has_discovery_credential ?? false,
     auth: server?.auth ?? "exchanged",
     audience: server?.audience ?? "",
     required: server?.required ?? requiredByDefault,
@@ -168,6 +166,19 @@ function connectionEdit(c: McpConnectionRow): McpEdit {
   };
 }
 
+/** Whether a save keeps a stored credential for the additional server named
+ *  `id`. The server keeps the credential of the stored server with the same
+ *  id, so a renamed row starts without one and a re-added id gets the old one back. */
+export const hasStoredCredential = (agent: Agent | undefined, id: string): boolean =>
+  agent?.mcp_servers.some((s) => s.id === id.trim() && s.has_discovery_credential) ?? false;
+
+/** The discovery probe for a connection: only a credential typed into the
+ *  form travels, never a stored one, and none while clearing. */
+export function discoverRequest(c: McpConnectionRow): McpDiscoverRequest {
+  const typed = c.clear_credential ? "" : c.credential.trim();
+  return { url: c.url.trim(), ...(typed ? { discovery_credential: typed } : {}) };
+}
+
 const blankServerRow = (r: McpServerRow): boolean =>
   !r.id.trim() &&
   !r.url.trim() &&
@@ -221,20 +232,16 @@ export function integrationEdit(
   };
 }
 
-/** The exact tool names an agent has — what the spill-skip picker offers:
- *  every server's exact allowlist entries (a `prefix.*` glob names nothing
- *  to pick) plus every granted tool. */
-export function concreteTools(allowedTools: string[], grants: GrantRow[], servers: McpServerRow[]): string[] {
-  const out: string[] = [];
-  const all = [
+/** What the spill-skip picker offers: every server's exact allowlist
+ *  entries (a `prefix.*` glob names nothing to pick) and granted tools, plus
+ *  whatever is already picked, so an entry an edit orphaned can be unticked. */
+export function spillSkipChoices(allowedTools: string[], f: IntegrationForm): string[] {
+  const exact = [
     ...allowedTools,
-    ...grants.flatMap((g) => names(g.tools)),
-    ...servers.flatMap((s) => [...names(s.allowed_tools), ...s.tool_grants.flatMap((g) => names(g.tools))]),
-  ];
-  for (const t of all) {
-    if (!t.endsWith(".*") && !out.includes(t)) out.push(t);
-  }
-  return out;
+    ...f.tool_grants.flatMap((g) => names(g.tools)),
+    ...f.mcp_servers.flatMap((s) => [...names(s.allowed_tools), ...s.tool_grants.flatMap((g) => names(g.tools))]),
+  ].filter((t) => !t.endsWith(".*"));
+  return [...new Set([...exact, ...f.spill_skip_tools])];
 }
 
 /** A discovered tool's name as the agent will see it, under `prefix`. */
