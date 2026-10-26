@@ -3688,19 +3688,20 @@ struct AgentEdit {
     passive_memory: Option<bool>,
 }
 
-/// An MCP server's connection as an edit or create body carries it. The
-/// credential is write-only: absent or `null` keeps the stored one, the empty
-/// string clears it, anything else replaces it. Every other field the body
-/// leaves out keeps its current value too; `null` resets an optional one to
-/// its default.
+/// An MCP server's connection as an edit or create body carries it, under
+/// [`edited`]'s rule: absent keeps the stored value, `null` resets it to the
+/// default, anything else replaces it. A blank `url` is that default: no
+/// primary server, and a refused additional one. The credential is
+/// write-only, so `null` keeps it as absence does and the empty string clears
+/// it.
 #[derive(Deserialize)]
 struct McpEdit {
-    #[serde(default)]
-    url: String,
+    #[serde(default, deserialize_with = "double_option")]
+    url: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     discovery_credential: Option<Option<String>>,
-    #[serde(default)]
-    auth: Option<McpAuth>,
+    #[serde(default, deserialize_with = "double_option")]
+    auth: Option<Option<McpAuth>>,
     #[serde(default, deserialize_with = "double_option")]
     audience: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
@@ -3731,21 +3732,20 @@ impl std::fmt::Debug for McpEdit {
 
 impl McpEdit {
     /// The primary server this edit yields over `current` (the agent's MCP
-    /// before the edit): `None` for a blank URL, else [`Self::over`] it.
+    /// before the edit): [`Self::over`] it, `None` when that leaves no URL.
     fn resolve(self, current: Option<McpSettings>) -> Option<McpSettings> {
-        (!self.url.trim().is_empty()).then(|| self.over(current.unwrap_or_default()))
+        Some(self.over(current.unwrap_or_default())).filter(|mcp| !mcp.url.is_empty())
     }
 
-    /// The connection this edit yields over `current`: what the body names
-    /// replaces, what it leaves out is kept.
+    /// The connection this edit yields over `current`.
     fn over(self, current: McpSettings) -> McpSettings {
         McpSettings {
-            url: self.url.trim().to_string(),
+            url: edited(self.url, current.url).trim().to_string(),
             discovery_credential: resolve_credential(
                 self.discovery_credential,
                 current.discovery_credential,
             ),
-            auth: self.auth.unwrap_or(current.auth),
+            auth: edited(self.auth, current.auth),
             audience: self.audience.unwrap_or(current.audience),
             required: self.required.unwrap_or(current.required),
             unavailable_skip_secs: self
@@ -3753,6 +3753,13 @@ impl McpEdit {
                 .unwrap_or(current.unavailable_skip_secs),
         }
     }
+}
+
+/// The edit rule every field of an MCP server follows: absent keeps `kept`,
+/// `null` resets to the default, a value replaces it. An `Option` field needs
+/// no helper: its default is `None`, so `edit.unwrap_or(kept)` is the rule.
+fn edited<T: Default>(edit: Option<Option<T>>, kept: T) -> T {
+    edit.map_or(kept, Option::unwrap_or_default)
 }
 
 /// The write-only credential rule: absent or `null` keeps `kept`, the empty
@@ -3765,38 +3772,39 @@ fn resolve_credential(edit: Option<Option<String>>, kept: Option<String>) -> Opt
 }
 
 /// An additional MCP server as an edit or create body carries it: its
-/// connection, under [`McpEdit`]'s rules, plus its own tool lists.
+/// connection plus its own tool lists, every field under [`edited`]'s rule.
 #[derive(Debug, Deserialize)]
 struct McpServerEdit {
     #[serde(default)]
     id: String,
     #[serde(flatten)]
     connection: McpEdit,
-    #[serde(default)]
-    tool_prefix: Option<String>,
-    #[serde(default)]
-    allowed_tools: Vec<String>,
-    #[serde(default)]
-    tool_grants: Vec<ToolGrant>,
+    #[serde(default, deserialize_with = "double_option")]
+    tool_prefix: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    allowed_tools: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "double_option")]
+    tool_grants: Option<Option<Vec<ToolGrant>>>,
 }
 
 impl McpServerEdit {
     /// The server this edit yields over `current` (the agent's servers before
-    /// the edit). What the connection keeps comes from the server with the
-    /// same id, so a renamed server starts with no credential.
+    /// the edit). What a field keeps comes from the server with the same id,
+    /// so a new or renamed server starts from the defaults: no URL (refused
+    /// by validation), no credential, no tools.
     fn resolve(self, current: &[McpServerSettings]) -> McpServerSettings {
         let id = self.id.trim().to_string();
         let kept = current
             .iter()
             .find(|s| s.id == id)
-            .map(|s| s.connection.clone())
+            .cloned()
             .unwrap_or_default();
         McpServerSettings {
-            connection: self.connection.over(kept),
+            connection: self.connection.over(kept.connection),
             id,
-            tool_prefix: self.tool_prefix,
-            allowed_tools: self.allowed_tools,
-            tool_grants: self.tool_grants,
+            tool_prefix: self.tool_prefix.unwrap_or(kept.tool_prefix),
+            allowed_tools: edited(self.allowed_tools, kept.allowed_tools),
+            tool_grants: edited(self.tool_grants, kept.tool_grants),
         }
     }
 }
@@ -3961,8 +3969,11 @@ fn validate_embed(embed: &EmbedSettings, checks: EmbedChecks) -> std::result::Re
     Ok(())
 }
 
-/// An MCP URL's shape: parseable, and http(s).
+/// An MCP URL's shape: present, parseable, and http(s).
 fn check_mcp_url(field: &str, url: &str) -> std::result::Result<(), String> {
+    if url.is_empty() {
+        return Err(format!("{field} is required"));
+    }
     let parsed = url::Url::parse(url).map_err(|e| format!("{field} is not a URL: {e}"))?;
     if matches!(parsed.scheme(), "http" | "https") {
         Ok(())
@@ -9427,6 +9438,162 @@ mod tenant_tests {
                 put(serde_json::json!({"mcp_servers": [], "spill_skip_tools": []})).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert!(stored().await.embed.mcp_servers.is_empty(), "[] removes them all");
+        })
+        .await;
+    }
+
+    /// Every field of an additional server's edit follows one rule: absent
+    /// keeps the stored value, `null` resets it to the default (refused where
+    /// the default is not a valid config), a value replaces it. A new id
+    /// starts from the defaults, and one without a URL is refused by name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_mcp_server_field_keeps_when_absent_resets_on_null_and_replaces_when_present() {
+        use workforce_common::session_postgres::PostgresSessionStore;
+        use workforce_postgres::test_support::with_test_pool;
+
+        with_test_pool(PostgresSessionStore::build_pool, |pool| async move {
+            let (state, _runtime, cookie) = agent_fixture(pool, None).await;
+            let primary = crate::mcp::tests::mock_mcp(&["acme.list_orders"]).await;
+            let docs = crate::mcp::tests::mock_mcp(&["search", "edit_page"]).await;
+            let docs_url = format!("{}/mcp", docs.uri());
+            let primary_url = format!("{}/mcp", primary.uri());
+            let put = |body: Value| {
+                let state = Arc::clone(&state);
+                let cookie = cookie.clone();
+                async move {
+                    send(
+                        &state,
+                        request(Method::PUT, "/admin/api/agents/support", &cookie, Some(body)),
+                    )
+                    .await
+                }
+            };
+            let listed = |id: &'static str| {
+                let state = Arc::clone(&state);
+                let cookie = cookie.clone();
+                async move {
+                    let (agent, _) = listed_agent(&state, &cookie, "support").await;
+                    agent["mcp_servers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|s| s["id"] == id)
+                        .cloned()
+                }
+            };
+            let grant = |requires: &str, tool: &str| {
+                serde_json::json!([{"source": "keycloak_role", "requires": requires, "tools": [tool]}])
+            };
+            let merged = |patch: Value| {
+                let mut row = serde_json::json!({
+                    "id": "docs", "url": docs_url, "auth": "exchanged", "audience": "docs-aud",
+                    "required": false, "unavailable_skip_secs": 15, "tool_prefix": "docs",
+                    "allowed_tools": ["docs.search"], "tool_grants": grant("editor", "docs.edit_page"),
+                });
+                row.as_object_mut()
+                    .unwrap()
+                    .extend(patch.as_object().unwrap().clone());
+                row
+            };
+            let (status, body) = put(serde_json::json!({"mcp": {"url": primary_url}})).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+
+            // (stored before, edit, the field it touches, what it reads after)
+            let cases = [
+                (serde_json::json!({}), serde_json::json!({"url": format!("{}/v2", docs.uri())}),
+                    "url", Value::from(format!("{}/v2", docs.uri()))),
+                (serde_json::json!({"audience": null}), serde_json::json!({"auth": "forwarded"}),
+                    "auth", "forwarded".into()),
+                (serde_json::json!({"auth": "forwarded", "audience": null}), serde_json::json!({"auth": null}),
+                    "auth", "exchanged".into()),
+                (serde_json::json!({}), serde_json::json!({"audience": "other-aud"}),
+                    "audience", "other-aud".into()),
+                (serde_json::json!({}), serde_json::json!({"audience": null}), "audience", Value::Null),
+                (serde_json::json!({}), serde_json::json!({"required": true, "unavailable_skip_secs": null}),
+                    "required", true.into()),
+                (serde_json::json!({"required": true, "unavailable_skip_secs": null}),
+                    serde_json::json!({"required": null}), "required", false.into()),
+                (serde_json::json!({}), serde_json::json!({"unavailable_skip_secs": 30}),
+                    "unavailable_skip_secs", 30.into()),
+                (serde_json::json!({}), serde_json::json!({"unavailable_skip_secs": null}),
+                    "unavailable_skip_secs", crate::agent::DEFAULT_UNAVAILABLE_SKIP_SECS.into()),
+                (serde_json::json!({}), serde_json::json!({"tool_prefix": "pages",
+                    "allowed_tools": ["pages.search"], "tool_grants": grant("editor", "pages.edit_page")}),
+                    "tool_prefix", "pages".into()),
+                (serde_json::json!({}), serde_json::json!({"tool_prefix": null, "allowed_tools": ["search"],
+                    "tool_grants": null}), "tool_prefix", Value::Null),
+                (serde_json::json!({}), serde_json::json!({"allowed_tools": ["docs.*"]}),
+                    "allowed_tools", serde_json::json!(["docs.*"])),
+                (serde_json::json!({}), serde_json::json!({"tool_grants": grant("admin", "docs.edit_page")}),
+                    "tool_grants", grant("admin", "docs.edit_page")),
+                (serde_json::json!({}), serde_json::json!({"tool_grants": null}),
+                    "tool_grants", serde_json::json!([])),
+            ];
+            for (before, edit, field, after) in cases {
+                let (status, body) = put(serde_json::json!({"mcp_servers": [merged(before.clone())]})).await;
+                assert_eq!(status, StatusCode::OK, "{before}: {body}");
+                let stored = listed("docs").await.unwrap();
+
+                let (status, body) = put(serde_json::json!({"mcp_servers": [{"id": "docs"}]})).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(listed("docs").await.unwrap(), stored, "a row naming only its id keeps every field");
+
+                let mut row = edit.clone();
+                row["id"] = "docs".into();
+                let (status, body) = put(serde_json::json!({"mcp_servers": [row]})).await;
+                assert_eq!(status, StatusCode::OK, "{edit}: {body}");
+                let now = listed("docs").await.unwrap();
+                assert_eq!(now[field], after, "{edit}");
+                let mut untouched = stored.as_object().unwrap().clone();
+                untouched.retain(|k, _| edit.get(k).is_none());
+                assert!(
+                    untouched.iter().all(|(k, v)| now[k.as_str()] == *v),
+                    "{edit} changed only what it named: {stored} -> {now}"
+                );
+            }
+
+            // A reset whose default is not a valid config is refused by name.
+            put(serde_json::json!({"mcp_servers": [merged(serde_json::json!({}))]})).await;
+            for (edit, message) in [
+                (serde_json::json!({"id": "docs", "url": null}), "mcp_servers[docs].url is required"),
+                (serde_json::json!({"id": "docs", "url": " "}), "mcp_servers[docs].url is required"),
+                (serde_json::json!({"id": "docs", "allowed_tools": null}),
+                    "mcp_servers[docs].allowed_tools must name at least one tool"),
+            ] {
+                let (status, body) = put(serde_json::json!({"mcp_servers": [edit]})).await;
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+                assert!(body.contains(message), "{body}");
+            }
+
+            // A new id starts from the defaults, and needs a URL.
+            let (status, body) = put(serde_json::json!({"mcp_servers": [
+                {"id": "docs"},
+                {"id": "wiki", "tool_prefix": "wiki", "allowed_tools": ["wiki.search"]},
+            ]}))
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert!(body.contains("mcp_servers[wiki].url is required"), "{body}");
+            let (status, body) = put(serde_json::json!({"mcp_servers": [
+                {"id": "docs"},
+                {"id": "wiki", "url": docs_url, "tool_prefix": "wiki", "allowed_tools": ["wiki.search"]},
+            ]}))
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                listed("wiki").await.unwrap(),
+                serde_json::json!({"id": "wiki", "url": docs_url, "auth": "exchanged", "audience": null,
+                    "required": false, "unavailable_skip_secs": crate::agent::DEFAULT_UNAVAILABLE_SKIP_SECS,
+                    "has_discovery_credential": false, "tool_prefix": "wiki",
+                    "allowed_tools": ["wiki.search"], "tool_grants": []})
+            );
+            assert_eq!(listed("docs").await.unwrap()["audience"], "docs-aud");
+
+            // The primary follows the same rule: a body without a URL keeps it.
+            let (status, body) = put(serde_json::json!({"mcp": {"auth": "forwarded"}})).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let (agent, _) = listed_agent(&state, &cookie, "support").await;
+            assert_eq!(agent["mcp_settings"]["url"], primary_url.as_str());
+            assert_eq!(agent["mcp_settings"]["auth"], "forwarded");
         })
         .await;
     }
