@@ -3,7 +3,7 @@
 The customer-facing side of [Workforce](https://github.com/driftwerk/workforce):
 an AI support agent you embed in your own web app as a chat widget. Your
 customers sign in through your identity provider (Keycloak or any OIDC issuer),
-and the agent acts on their behalf against your company's MCP server — only with
+and the agent acts on their behalf against your company's MCP servers — only with
 the tools you allow, and only as that customer.
 
 It runs as its own service with its own Postgres and vector store, isolated
@@ -34,6 +34,16 @@ cp config/edge.example.toml edge.toml   # set Postgres, the vector store, the LL
 
 The service listens on `[server] bind` (default `0.0.0.0:8080`). Embed the
 widget in your app with the snippet the admin UI shows for each agent.
+
+An agent acts against one primary MCP server (`[agents.embed.mcp]`) and,
+optionally, more servers alongside it (`[[agents.embed.mcp_servers]]`). Each
+server has its own URL, credential, auth mode, token audience, allowlist and
+write tiers. A server that is not `required` being down only removes its tools
+for that turn. Give each server its own token-exchange `audience`, so a token
+minted for one server is not accepted by another. `config/edge.example.toml`
+describes every key. `edge.toml` seeds agents on first boot only, so an
+existing install adds servers through the admin UI, the admin API or its git
+config.
 
 Edge builds against the Workforce core crates, pinned to one revision in
 `Cargo.toml`. To work against a local core checkout, see `.cargo/config.toml`.
