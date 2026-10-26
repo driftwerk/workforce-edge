@@ -70,15 +70,15 @@ tool's arguments or a URL.
 
 | Metric | Type | Labels |
 |---|---|---|
-| `edge_mcp_discovery_total` | counter | `agent`, `server`, `phase` (`startup`, `lazy`, `refresh`), `outcome` (`ok`, `failed`, `timed_out`) |
-| `edge_mcp_discovery_duration_seconds` | histogram | `agent`, `server`, `phase` |
-| `edge_mcp_tools_cache_total` | counter | `agent`, `server`, `result` (`hit`, `miss`, `stale`) |
-| `edge_mcp_tool_calls_total` | counter | `agent`, `server`, `tool`, `outcome` (`ok`, `tool_error`, `transport_error`, `timeout`) |
-| `edge_mcp_tool_call_duration_seconds` | histogram | `agent`, `server`, `tool` |
-| `edge_mcp_server_skipped_total` | counter | `agent`, `server`. A turn skipped a server inside its skip window. |
-| `edge_mcp_skip_window_entered_total` | counter | `agent`, `server`. A timed-out turn start opened a server's skip window. |
-| `edge_mcp_token_exchanges_total` | counter | `agent`, `audience`, `outcome` (`ok`, `failed`) |
-| `edge_mcp_token_exchange_duration_seconds` | histogram | `agent`, `audience` |
+| `edge_mcp_discovery_total` | counter | `tenant`, `agent`, `server`, `phase` (`startup`, `lazy`, `refresh`), `outcome` (`ok`, `failed`, `timed_out`) |
+| `edge_mcp_discovery_duration_seconds` | histogram | `tenant`, `agent`, `server`, `phase` |
+| `edge_mcp_tools_cache_total` | counter | `tenant`, `agent`, `server`, `result` (`hit`, `miss`, `stale`) |
+| `edge_mcp_tool_calls_total` | counter | `tenant`, `agent`, `server`, `tool`, `outcome` (`ok`, `tool_error`, `transport_error`, `timeout`) |
+| `edge_mcp_tool_call_duration_seconds` | histogram | `tenant`, `agent`, `server`, `tool` |
+| `edge_mcp_server_skipped_total` | counter | `tenant`, `agent`, `server`. A turn skipped a server inside its skip window. |
+| `edge_mcp_skip_window_entered_total` | counter | `tenant`, `agent`, `server`. A timed-out turn start opened a server's skip window. |
+| `edge_mcp_token_exchanges_total` | counter | `tenant`, `agent`, `audience`, `outcome` (`ok`, `failed`) |
+| `edge_mcp_token_exchange_duration_seconds` | histogram | `tenant`, `agent`, `audience` |
 | `edge_mcp_config_refusals_total` | counter | `reason`, one of `missing_primary`, `invalid_id`, `reserved_id`, `duplicate_id`, `invalid_prefix`, `empty_allowlist`, `invalid_grant`, `outside_prefix`, `invalid_audience`, `skip_on_required`, `name_collision` |
 
 ## Docker
