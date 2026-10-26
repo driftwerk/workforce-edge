@@ -66,6 +66,18 @@ use workforce_memory::audit::DerivedFigureDetector;
 const ALLOW_ALL_POLICY: &str =
     "rules:\n  - name: allow-all\n    scope: global\n    tool: \"*\"\n    action: allow\n";
 
+/// Every tool the host registers itself, after the MCP tools. An MCP tool that
+/// would reach the model under one of these names is dropped at discovery.
+pub(crate) const BUILT_IN_TOOLS: &[&str] = &[
+    "memory",
+    "edge.version",
+    workforce_agent::tools::export_xlsx::EXPORT_XLSX_TOOL_NAME,
+    workforce_agent::tools::data::DATA_QUERY_TOOL_NAME,
+    workforce_agent::tools::data::DATA_INSPECT_TOOL_NAME,
+    "playbook",
+    "image.fetch",
+];
+
 /// Tool-round cap for a single customer turn.
 const MAX_ROUNDS: u32 = 24;
 

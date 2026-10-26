@@ -21,13 +21,15 @@ use eyre::{eyre, Result, WrapErr};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use workforce_agent::runner::to_llm_name;
 use workforce_agent::tools::registry::ToolRegistry;
 use workforce_agent::tools::{Tool, ToolResult};
 use workforce_mcp_client::{
     AuthProvider, McpClient, McpError, McpLimits, McpToolDef, NoAuth, StaticBearer, ToolNameInfo,
 };
 
-use crate::agent::EmbedSettings;
+use crate::agent::{allowlist_admits, EmbedSettings};
+use crate::host::BUILT_IN_TOOLS;
 use crate::outbound::{self, OutboundPolicy};
 
 /// Cap on a single company-MCP `tools/call` result body — well above the
@@ -71,6 +73,17 @@ where
         Ok(Err(error)) => Err(eyre!("MCP {op} failed: {error}")),
         Err(_) => Err(eyre!("MCP {op} timed out after {}s", limit.as_secs())),
     }
+}
+
+/// Whether `tool` reaches the model under a built-in's name. Compared in LLM-name
+/// space, where `data_query` and `data.query` are the same name: the runner
+/// resolves a direct match first, so an MCP twin would take the built-in's
+/// calls.
+fn shadows_builtin(tool: &str) -> bool {
+    let wire = to_llm_name(tool);
+    BUILT_IN_TOOLS
+        .iter()
+        .any(|builtin| to_llm_name(builtin) == wire)
 }
 
 /// The customer's MCP bearer, shared between the socket that refreshes it from
@@ -271,20 +284,22 @@ impl McpToolset {
         deadline(
             "tools/list",
             MCP_HANDSHAKE_TIMEOUT,
-            client.tools_list_filtered(|name| self.tool_allowed(name)),
+            client.tools_list_filtered(|name| self.serves(name)),
         )
         .await
     }
 
-    /// Whether a tool survives the closed allowlist: an exact match, or a
-    /// `prefix.*` glob on the dotted namespace.
-    fn tool_allowed(&self, tool: &str) -> bool {
-        self.allowed_tools
-            .iter()
-            .any(|entry| match entry.strip_suffix(".*") {
-                Some(prefix) => tool == prefix || tool.starts_with(&format!("{prefix}.")),
-                None => tool == entry,
-            })
+    /// Whether a discovered tool is served: the closed allowlist admits it, and
+    /// it does not take a built-in's name on the wire.
+    fn serves(&self, tool: &str) -> bool {
+        if !allowlist_admits(&self.allowed_tools, tool) {
+            return false;
+        }
+        let shadows = shadows_builtin(tool);
+        if shadows {
+            tracing::warn!(tool, "MCP tool shadows a built-in; dropped");
+        }
+        !shadows
     }
 
     /// Names of the discovered, allowlisted tools — best-effort snapshot for
@@ -684,14 +699,23 @@ pub(crate) mod tests {
         assert!(err.contains("invalid MCP url"), "got: {err}");
     }
 
-    #[test]
-    fn allowlist_filters_discovered_tools() {
-        let mut ts = McpToolset::empty();
-        ts.allowed_tools = vec!["harbor.*".into(), "ping".into()];
-        assert!(ts.tool_allowed("harbor.list_orders"));
-        assert!(ts.tool_allowed("ping"));
-        assert!(!ts.tool_allowed("other.tool"));
-        assert!(!ts.tool_allowed("pingx"));
+    /// A server advertising a built-in's name — exactly, or as its underscore
+    /// twin — never reaches the registry, even when the allowlist admits it.
+    #[tokio::test]
+    async fn a_tool_shadowing_a_built_in_is_dropped() {
+        let server = mock_mcp(&["data_query", "memory", "edge_version", "orders"]).await;
+        let mut settings = embed(&server.uri(), Some("svc-cred"));
+        settings.allowed_tools = vec![
+            "data_query".into(),
+            "memory".into(),
+            "edge_version".into(),
+            "orders".into(),
+        ];
+        let toolset = McpToolset::discover(&settings)
+            .await
+            .unwrap()
+            .expect("an mcp is configured");
+        assert_eq!(toolset.tool_names(), vec!["orders".to_string()]);
     }
 
     #[tokio::test]
