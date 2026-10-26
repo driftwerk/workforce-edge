@@ -47,11 +47,24 @@ impl std::fmt::Debug for MetricsConfig {
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
-/// Install the global Prometheus recorder, as the core crates do. A failure
-/// is logged, not fatal: the endpoint then says the recorder is missing.
+/// How often the recorder's histograms are drained, so an edge nobody scrapes
+/// does not hold every sample since boot — the exporter's own default.
+const UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Install the global Prometheus recorder, as the core crates do, and run its
+/// upkeep on the current runtime. A failure is logged, not fatal: the
+/// endpoint then says the recorder is missing.
 pub fn install_recorder() {
     match PrometheusBuilder::new().install_recorder() {
         Ok(handle) => {
+            let upkeep = handle.clone();
+            tokio::spawn(async move {
+                let mut ticks = tokio::time::interval(UPKEEP_INTERVAL);
+                loop {
+                    ticks.tick().await;
+                    upkeep.run_upkeep();
+                }
+            });
             let _ = HANDLE.set(handle);
         }
         Err(e) => tracing::warn!(error = %e, "failed to install the Prometheus recorder"),
