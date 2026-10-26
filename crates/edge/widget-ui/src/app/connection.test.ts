@@ -123,6 +123,25 @@ describe("EdgeConnection stream", () => {
     expect(last(out.yields)).toBe("hi");
   });
 
+  it("rewind replaces the accumulated answer", async () => {
+    const { out, ws } = await connectedStream();
+    ws.frame({ type: "token", content: "Earlier text. " });
+    ws.frame({ type: "token", content: "The abandoned" });
+    ws.frame({ type: "rewind", content: "Earlier text. " });
+    ws.frame({ type: "token", content: "The real answer." });
+    await settle();
+    expect(last(out.yields)).toBe("Earlier text. The real answer.");
+    expect(out.done).toBe(false);
+  });
+
+  it("rewind can take back the whole answer", async () => {
+    const { out, ws } = await connectedStream();
+    ws.frame({ type: "token", content: "The abandoned" });
+    ws.frame({ type: "rewind", content: "" });
+    await settle();
+    expect(last(out.yields)).toBe("");
+  });
+
   it("ignores a stray resume that arrives outside recovery", async () => {
     // A `resume` only follows a drop; one arriving mid-stream without a drop is
     // a re-attach to a DIFFERENT turn on this conversation and must not seed our

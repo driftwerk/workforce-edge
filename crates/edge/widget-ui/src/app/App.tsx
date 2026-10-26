@@ -998,8 +998,9 @@ const ChatPanel = memo(function ChatPanel({
       )) {
         armGap();
         lastText = acc;
+        // An empty answer is a rewind that took everything back: still working.
         setMessages((m) =>
-          m.map((x) => (x.id === botId ? { ...x, text: acc, working: false, status: undefined } : x)),
+          m.map((x) => (x.id === botId ? { ...x, text: acc, working: !acc, status: undefined } : x)),
         );
       }
       // Attach the answer's id + conversation so it can be rated. The socket knows

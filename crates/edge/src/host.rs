@@ -204,6 +204,10 @@ pub enum CustomerEvent {
     /// The accumulated answer text so far, replayed to a socket that (re)attached
     /// to a turn already in flight — the receiver replaces, not appends.
     Resume { text: String },
+    /// The answer text as it now stands, after the agent took back what a
+    /// model call it is regenerating had streamed — the receiver replaces,
+    /// not appends.
+    Rewind { text: String },
 }
 
 /// What a late-attaching socket must be told to catch up with a running turn.
@@ -241,6 +245,7 @@ impl ActiveTurn {
         match event {
             CustomerEvent::Typing => shared.replay.typing = true,
             CustomerEvent::Delta { text } => shared.replay.text.push_str(text),
+            CustomerEvent::Rewind { text } => shared.replay.text = text.clone(),
             // Done is terminal: mark ended now so a socket attaching in the
             // window before the relay's own `end` gets `None` (and the saved
             // answer via REST) rather than a `Resume` with no closing `Done`.
@@ -1713,10 +1718,12 @@ impl AgentHost {
         let mut streamed_any = false;
         let mut round_had_text = false;
         let mut pending_break = false;
-        // Where the current round's text began, with the paragraph-gap state it
-        // consumed on the way in, so a retry can drop just that round and put
-        // the gap back — leaving what the customer already read untouched.
-        let mut round_mark: Option<(RoundMark, bool)> = None;
+        // Where the current model call's text began, with the paragraph-gap
+        // state it consumed on the way in, so a discarded call can be dropped
+        // and the gap put back — leaving what the customer already read from
+        // earlier calls untouched. Kept across the call's segments; cleared
+        // when the next call begins.
+        let mut call_mark: Option<(RoundMark, bool)> = None;
         let deadline = tokio::time::sleep(MAX_TURN);
         tokio::pin!(deadline);
         loop {
@@ -1768,24 +1775,52 @@ impl AgentHost {
                                 }
                             }
                         }
-                        // The runner is dropping this round's streamed text. A
-                        // superseded draft is a real answer the customer has
-                        // already read, so it stays — only the round marker
-                        // resets, and the next round opens a new paragraph. A
-                        // retry means the text was a tool call emitted as prose:
-                        // rewind that round alone, never what preceded it.
+                        if matches!(event, ProgressEvent::LlmCall { .. }) {
+                            call_mark = None;
+                        }
+                        // The runner is dropping streamed text. A superseded
+                        // draft is a real answer the customer has already read,
+                        // so it stays — only the mark resets, and the next round
+                        // opens a new paragraph. A retry (a tool call emitted as
+                        // prose) or an interrupted reply voids the call's text:
+                        // rewind to where the call began, never before it, and
+                        // show the customer the answer as it now stands.
                         if let ProgressEvent::StreamDiscard { reason } = &event {
                             match reason {
-                                StreamDiscardReason::Retry => {
-                                    if let Some((mark, gap_before)) = round_mark {
+                                StreamDiscardReason::Retry | StreamDiscardReason::Interrupted => {
+                                    if let Some((mark, gap_before)) = call_mark {
+                                        let shown = redactor.sent().len();
                                         redactor.rewind(mark);
                                         streamed_any = !mark.is_start();
                                         pending_break = gap_before;
+                                        if redactor.sent().len() < shown
+                                            && events
+                                                .send(CustomerEvent::Rewind {
+                                                    text: redactor.sent().to_string(),
+                                                })
+                                                .await
+                                                .is_err()
+                                        {
+                                            cancel.cancel();
+                                            handle.abort();
+                                            self.record_turn(
+                                                &req,
+                                                None,
+                                                TurnOutcome::Cancelled,
+                                                None,
+                                                None,
+                                                "",
+                                                None,
+                                            );
+                                            return Ok(());
+                                        }
                                     }
                                 }
-                                StreamDiscardReason::Superseded => pending_break |= round_had_text,
+                                StreamDiscardReason::Superseded => {
+                                    pending_break |= round_had_text;
+                                    call_mark = None;
+                                }
                             }
-                            round_mark = None;
                             round_had_text = false;
                         }
                         // A round's stream ended: if it produced text, the next
@@ -1802,9 +1837,9 @@ impl AgentHost {
                             // and only then get its ending — delivered on the
                             // front of the *next* section.
                             //
-                            // Safe against a retry: `StreamDiscard{Retry}`
-                            // clears `round_had_text` before the `StreamEnd`
-                            // that follows it, so a rewound round never reaches
+                            // Safe against a discard: it clears
+                            // `round_had_text` before any `StreamEnd` that
+                            // follows it, so a rewound segment never reaches
                             // here. Safe against later rounds: `emit` clamps to
                             // what it has already emitted, so a push after a
                             // flush can only add.
@@ -1830,13 +1865,12 @@ impl AgentHost {
                             }
                             pending_break = true;
                             round_had_text = false;
-                            round_mark = None;
                         }
                         if let Some(text) = answer_delta(&event) {
-                            // Mark before the paragraph break so a retry rewinds
-                            // the gap along with the round that opened it.
-                            if round_mark.is_none() {
-                                round_mark = Some((redactor.mark(), pending_break));
+                            // Mark before the paragraph break so a rewind takes
+                            // the gap along with the call that opened it.
+                            if call_mark.is_none() {
+                                call_mark = Some((redactor.mark(), pending_break));
                             }
                             // Separate consecutive text rounds with a blank line —
                             // unless the producer already opened the paragraph. The
@@ -2947,6 +2981,7 @@ pub(crate) mod tests {
 
     use async_trait::async_trait;
     use workforce_agent::llm::provider::LlmProvider;
+    use workforce_agent::llm::streaming::StreamEvent;
     use workforce_agent::llm::types::{LlmResponse, LlmToolDef, Role, StopReason, TokenUsage};
     use workforce_common::session::InMemorySessionStore;
 
@@ -3977,6 +4012,197 @@ prompt = "Confirm."
              before: {before:?}\n  round-2 delta: {:?}",
             deltas[at]
         );
+    }
+
+    /// Replays one scripted event sequence per LLM call — the raw stream a
+    /// failover layer hands the runner, restarts included.
+    struct EventScriptProvider {
+        calls: Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+    }
+
+    impl EventScriptProvider {
+        fn new(calls: Vec<Vec<StreamEvent>>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(calls.into()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for EventScriptProvider {
+        async fn create_message(
+            &self,
+            _system_prompt: Option<&str>,
+            _messages: &[LlmMessage],
+            _tools: &[LlmToolDef],
+            _model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _enable_cache: bool,
+        ) -> Result<LlmResponse> {
+            unreachable!("streamed only")
+        }
+
+        async fn create_message_stream(
+            &self,
+            _system_prompt: Option<&str>,
+            _messages: &[LlmMessage],
+            _tools: &[LlmToolDef],
+            _model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _enable_cache: bool,
+            tx: mpsc::Sender<StreamEvent>,
+        ) -> Result<()> {
+            let events = self
+                .calls
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("streamed past the script");
+            for event in events {
+                let _ = tx.send(event).await;
+            }
+            Ok(())
+        }
+    }
+
+    /// Longer than the redactor's 64-byte holdback, so the customer has seen
+    /// part of it before the call breaks off.
+    const ABANDONED: &str = "This reply was cut off part-way through when the provider \
+        ran out of capacity, so none of it should stand.";
+    const EARLIER: &str = "Here is what I found in the first pass over the records, before \
+        looking anything else up.";
+
+    fn text_block(text: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ContentStart { index: 0 },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: text.into(),
+            },
+            StreamEvent::ContentStop { index: 0 },
+        ]
+    }
+
+    fn done(stop_reason: StopReason) -> StreamEvent {
+        StreamEvent::MessageDone {
+            stop_reason,
+            usage: TokenUsage::default(),
+        }
+    }
+
+    fn tool_call(index: usize) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolUseStart {
+                index,
+                id: format!("t{index}"),
+                name: "remember".into(),
+                signature: None,
+            },
+            StreamEvent::InputJsonDelta {
+                index,
+                partial: r#"{"fact": "x"}"#.into(),
+            },
+            StreamEvent::ContentStop { index },
+        ]
+    }
+
+    /// What the customer saw: the rewinds, and the final answer.
+    async fn customer_view(calls: Vec<Vec<StreamEvent>>) -> (Vec<String>, String) {
+        let host = AgentHost::for_test(
+            test_agent(),
+            EventScriptProvider::new(calls),
+            Arc::new(InMemorySessionStore::new()),
+        );
+        let (tx, mut rx) = mpsc::channel::<CustomerEvent>(64);
+        host.drive_turn(
+            Arc::new(ToolRegistry::new()),
+            req(),
+            tx,
+            Default::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("drive_turn");
+        let mut rewinds = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                CustomerEvent::Rewind { text } => rewinds.push(text),
+                CustomerEvent::Done { text, .. } => return (rewinds, text),
+                _ => {}
+            }
+        }
+        panic!("the turn never finished");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_interrupted_call_rewinds_the_customer_view() {
+        let (rewinds, answer) = customer_view(vec![
+            [
+                text_block(EARLIER),
+                tool_call(1),
+                vec![done(StopReason::ToolUse)],
+            ]
+            .concat(),
+            [
+                vec![
+                    StreamEvent::ContentStart { index: 0 },
+                    StreamEvent::TextDelta {
+                        index: 0,
+                        text: ABANDONED.into(),
+                    },
+                    StreamEvent::Restart,
+                ],
+                text_block("The real answer."),
+                vec![done(StopReason::EndTurn)],
+            ]
+            .concat(),
+        ])
+        .await;
+
+        assert_eq!(rewinds, [EARLIER]);
+        assert_eq!(answer, format!("{EARLIER}\n\nThe real answer."));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_discard_after_stream_end_still_rewinds_the_call() {
+        let (rewinds, answer) = customer_view(vec![[
+            text_block(ABANDONED),
+            tool_call(1),
+            vec![StreamEvent::Restart],
+            text_block("The real answer."),
+            vec![done(StopReason::EndTurn)],
+        ]
+        .concat()])
+        .await;
+
+        assert_eq!(rewinds, [""]);
+        assert_eq!(answer, "The real answer.");
+    }
+
+    #[test]
+    fn a_reattach_after_a_rewind_replays_the_corrected_text() {
+        let turn = ActiveTurn {
+            cancel: CancellationToken::new(),
+            shared: Arc::new(Mutex::new(TurnShared {
+                replay: TurnReplay::default(),
+                subscriber: None,
+                ended: false,
+            })),
+            task: Mutex::new(None),
+        };
+        turn.record(&CustomerEvent::Delta {
+            text: "Kept. ".into(),
+        });
+        turn.record(&CustomerEvent::Delta {
+            text: "Abandoned".into(),
+        });
+        turn.record(&CustomerEvent::Rewind {
+            text: "Kept. ".into(),
+        });
+        turn.record(&CustomerEvent::Delta {
+            text: "Real.".into(),
+        });
+        assert_eq!(turn.shared.lock().unwrap().replay.text, "Kept. Real.");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
