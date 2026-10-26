@@ -136,7 +136,8 @@ pub struct TokenExchangeConfig {
     pub client_secret: String,
     /// The MCP server's Keycloak clientId; when set, the exchanged token is
     /// audience-scoped to it. Absent ⇒ the token still gains a fresh TTL, just
-    /// without the audience restriction.
+    /// without the audience restriction. A server naming its own `audience` is
+    /// exchanged for that one instead.
     #[serde(default)]
     pub audience: Option<String>,
     /// Space-separated scopes to request on the exchanged token. Keycloak
