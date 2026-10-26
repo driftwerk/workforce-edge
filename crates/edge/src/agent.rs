@@ -47,8 +47,9 @@ pub struct EdgeAgent {
     /// The public-surface gate.
     pub embed: EmbedSettings,
     /// This agent's own words for the "Looking up …" label a customer sees
-    /// while a company-MCP operation runs, checked in order before the generic
-    /// defaults — so a deployment's domain vocabulary lives in its config.
+    /// while a company-MCP operation or a direct MCP tool runs, checked in
+    /// order before the generic defaults — so a deployment's domain vocabulary
+    /// lives in its config.
     #[serde(default)]
     pub progress_labels: Vec<ProgressLabel>,
     /// This agent's domain words for refusing derived figures ("23 unfilled
@@ -57,8 +58,9 @@ pub struct EdgeAgent {
     pub derived_figures: workforce_common::settings::DerivedFigureVocabulary,
 }
 
-/// One "Looking up …" label: an invoked operation whose name contains
-/// `needle` (case-insensitively) reads as "Looking up {label}".
+/// One "Looking up …" label: an invoked operation or MCP tool whose name
+/// contains `needle` (case-insensitively) reads as "Looking up {label}" — or
+/// "Updating {label}" for a tool named as a write (`create_lead`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgressLabel {
     pub needle: String,
