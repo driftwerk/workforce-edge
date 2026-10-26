@@ -45,7 +45,8 @@ interface ServerFrame {
     | "reconnect"
     | "ping"
     | "progress"
-    | "resume";
+    | "resume"
+    | "rewind";
   content?: string;
   session_id?: string;
   /** The assistant message's id — present only on `done`, so the widget can rate
@@ -311,6 +312,11 @@ export class EdgeConnection {
       if (m.type === "token") {
         clearRecovery();
         acc += m.content ?? "";
+        queue.push(acc);
+      } else if (m.type === "rewind") {
+        // The reply is being regenerated: what it had streamed is taken back.
+        clearRecovery();
+        acc = m.content ?? "";
         queue.push(acc);
       } else if (m.type === "done") {
         clearRecovery();

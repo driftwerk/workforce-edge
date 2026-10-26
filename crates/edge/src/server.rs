@@ -1634,6 +1634,9 @@ fn customer_frame(event: &CustomerEvent, session_id: &str) -> ServerFrame {
         CustomerEvent::Resume { text } => {
             ServerFrame::new("resume", Some(text.clone()), session_id)
         }
+        CustomerEvent::Rewind { text } => {
+            ServerFrame::new("rewind", Some(text.clone()), session_id)
+        }
     }
 }
 
@@ -6544,6 +6547,18 @@ mod tests {
         );
         assert_eq!(resume.kind, "resume");
         assert_eq!(resume.content.as_deref(), Some("so far"));
+    }
+
+    #[test]
+    fn a_rewind_frame_carries_the_corrected_text() {
+        let rewind = customer_frame(
+            &CustomerEvent::Rewind {
+                text: "as it stands".into(),
+            },
+            "s",
+        );
+        assert_eq!(rewind.kind, "rewind");
+        assert_eq!(rewind.content.as_deref(), Some("as it stands"));
     }
 
     #[test]
