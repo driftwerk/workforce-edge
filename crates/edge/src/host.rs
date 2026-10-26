@@ -4453,6 +4453,64 @@ prompt = "Confirm."
         assert_eq!(names, ["docs.search", "harbor.list_orders"]);
     }
 
+    /// A `backend_permissions` grant that exists only on an additional server
+    /// still fetches the user's permissions, and the tool it unlocks survives
+    /// narrowing for a user who holds the permission.
+    #[tokio::test]
+    async fn an_additional_servers_backend_grant_fetches_permissions() {
+        use crate::agent::{GrantSource, McpServerSettings, PermissionsConfig, ToolGrant};
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        let backend = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"permissions": ["docs:edit"], "roles": []})),
+            )
+            .mount(&backend)
+            .await;
+        let embed = EmbedSettings {
+            keycloak_issuer: format!("{}/realms/northwind", backend.uri()),
+            allowed_tools: vec!["harbor.list_orders".into()],
+            permissions: Some(PermissionsConfig {
+                url: format!("{}/users/{{user}}/permissions", backend.uri()),
+                cache_ttl_secs: None,
+            }),
+            mcp_servers: vec![McpServerSettings {
+                id: "docs".into(),
+                tool_prefix: Some("docs".into()),
+                allowed_tools: vec!["docs.search".into()],
+                tool_grants: vec![ToolGrant {
+                    source: GrantSource::BackendPermissions,
+                    requires: "docs:edit".into(),
+                    tools: vec!["docs.edit_page".into()],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let host = AgentHost::for_test(
+            Arc::new(EdgeAgent {
+                id: "northwind-help".into(),
+                embed: embed.clone(),
+                ..Default::default()
+            }),
+            Arc::new(BlockingProvider),
+            Arc::new(InMemorySessionStore::new()),
+        );
+        let caps = host.resolve_capabilities(&req()).await;
+        assert!(
+            !backend.received_requests().await.unwrap().is_empty(),
+            "the permissions endpoint was asked"
+        );
+        let tools = ToolRegistry::new();
+        for name in ["harbor.list_orders", "docs.search", "docs.edit_page"] {
+            tools.register(Arc::new(NamedTool(name)));
+        }
+        withhold_ungranted_tools(&tools, &embed, |g| caps.satisfies(g));
+        assert!(tools.has("docs.edit_page"), "{:?}", tools.names());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drive_turn_emits_progress_for_a_tool_round() {
         let tools = ToolRegistry::new();
