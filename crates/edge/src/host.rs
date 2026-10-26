@@ -52,6 +52,7 @@ use crate::analytics::{
 use crate::boot::DataPlane;
 use crate::config::LlmConfig;
 use crate::mcp::{McpCatalogue, TokenCell};
+use crate::metrics::AgentScope;
 use crate::outbound::OutboundPolicy;
 use crate::playbook::{AgentPlaybooks, EdgePlaybookTool, PlaybookCatalog};
 use crate::settings::LlmStatusReporter;
@@ -607,9 +608,14 @@ impl AgentHost {
             PolicyEngine::from_yaml(ALLOW_ALL_POLICY).wrap_err("building edge policy engine")?,
         );
         let sessions: Arc<dyn SessionStore> = data_plane.session_store(&agent.id);
-        let mcp = McpCatalogue::build(&agent.id, &agent.embed, outbound, token_exchange)
-            .await
-            .wrap_err_with(|| format!("discovering MCP tools for agent {}", agent.id))?;
+        let mcp = McpCatalogue::build(
+            AgentScope::new(data_plane.tenant.as_str(), &agent.id),
+            &agent.embed,
+            outbound,
+            token_exchange,
+        )
+        .await
+        .wrap_err_with(|| format!("discovering MCP tools for agent {}", agent.id))?;
         if agent.embed.keycloak_audience.is_none() {
             tracing::warn!(
                 agent = %agent.id,
