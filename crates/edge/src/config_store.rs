@@ -23,10 +23,11 @@ use crate::tenant::{TenantId, TenantPool};
 /// [`EdgeAgent`] as JSON). Shares the session pool, whose `search_path` is
 /// pinned to the `sessions` schema.
 ///
-/// The one secret in an agent, `embed.mcp.discovery_credential`, is sealed
-/// inside the JSON under the install's master key when there is one — stored
-/// as `{"sealed": "<base64>"}` in the field's place, bound to the tenant and
-/// agent — and opened on load. A cleartext value from before the key is read
+/// The secrets in an agent, each MCP server's `discovery_credential`, are
+/// sealed inside the JSON under the install's master key when there is one —
+/// stored as `{"sealed": "<base64>"}` in the field's place, bound to the
+/// tenant, the agent and (for an additional server) the server's id — and
+/// opened on load. A cleartext value from before the key is read
 /// as it is and sealed by the next write. Without a master key the field is
 /// stored as it always was.
 #[derive(Clone)]
@@ -48,71 +49,94 @@ impl EdgeConfigStore {
         }
     }
 
-    fn credential_aad(&self, agent: &str) -> Vec<u8> {
-        format!(
-            "edge-agent/v1/{}/{agent}/{DISCOVERY_CREDENTIAL}",
-            self.tenant
-        )
-        .into_bytes()
+    fn credential_aad(&self, agent: &str, field: &str) -> Vec<u8> {
+        format!("edge-agent/v1/{}/{agent}/{field}", self.tenant).into_bytes()
     }
 
-    /// The credential's slot in an agent's JSON, when the agent has an MCP.
-    fn credential_field(config: &mut serde_json::Value) -> Option<&mut serde_json::Value> {
-        config
-            .get_mut("embed")?
-            .get_mut("mcp")?
-            .get_mut(DISCOVERY_CREDENTIAL)
+    /// Every credential slot in an agent's JSON, as its JSON pointer, the
+    /// field its seal is bound to, and the server it belongs to. The primary
+    /// keeps the field it always had; an additional server's is bound to its
+    /// id, so reordering servers keeps every seal openable while a seal moved
+    /// to another server does not open.
+    fn credential_slots(config: &serde_json::Value) -> Vec<(String, String, String)> {
+        let primary = (
+            format!("/embed/mcp/{DISCOVERY_CREDENTIAL}"),
+            DISCOVERY_CREDENTIAL.to_string(),
+            crate::agent::PRIMARY_MCP_ID.to_string(),
+        );
+        let additional = config
+            .pointer("/embed/mcp_servers")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(i, server)| {
+                let id = server.get("id")?.as_str()?;
+                Some((
+                    format!("/embed/mcp_servers/{i}/{DISCOVERY_CREDENTIAL}"),
+                    format!("mcp_servers/{id}/{DISCOVERY_CREDENTIAL}"),
+                    id.to_string(),
+                ))
+            });
+        std::iter::once(primary).chain(additional).collect()
     }
 
-    /// Seal the credential inside an agent's JSON, when there is a key and a
-    /// cleartext credential to seal.
-    fn seal_credential(&self, agent: &str, config: &mut serde_json::Value) -> Result<()> {
+    /// Seal every cleartext credential inside an agent's JSON, when there is a
+    /// key.
+    fn seal_credentials(&self, agent: &str, config: &mut serde_json::Value) -> Result<()> {
         let Some(master) = &self.master else {
             return Ok(());
         };
-        let Some(field) = Self::credential_field(config) else {
-            return Ok(());
-        };
-        let Some(cleartext) = field.as_str() else {
-            return Ok(());
-        };
-        let sealed = master
-            .seal(&self.credential_aad(agent), cleartext.as_bytes())
-            .wrap_err_with(|| format!("sealing the discovery credential of agent {agent}"))?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(sealed.to_bytes());
-        *field = serde_json::json!({ SEALED: encoded });
+        for (pointer, field, server) in Self::credential_slots(config) {
+            let Some(slot) = config.pointer_mut(&pointer) else {
+                continue;
+            };
+            let Some(cleartext) = slot.as_str() else {
+                continue;
+            };
+            let sealed = master
+                .seal(&self.credential_aad(agent, &field), cleartext.as_bytes())
+                .wrap_err_with(|| {
+                    format!("sealing the discovery credential of agent {agent} (server {server})")
+                })?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(sealed.to_bytes());
+            *slot = serde_json::json!({ SEALED: encoded });
+        }
         Ok(())
     }
 
-    /// Open a sealed credential inside an agent's JSON back into the string
-    /// the agent struct expects. A sealed value with no key to open it is an
-    /// error, not a silently empty credential.
-    fn open_credential(&self, agent: &str, config: &mut serde_json::Value) -> Result<()> {
-        let Some(field) = Self::credential_field(config) else {
-            return Ok(());
-        };
-        let Some(encoded) = field.get(SEALED).and_then(|sealed| sealed.as_str()) else {
-            return Ok(());
-        };
-        let Some(master) = &self.master else {
-            return Err(eyre!(
-                "agent {agent} holds a sealed discovery credential but EDGE_MASTER_KEY is not set"
-            ));
-        };
-        let opened = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|_| eyre!("malformed sealed credential"))
-            .and_then(|bytes| Ok(Sealed::from_bytes(&bytes)?))
-            .and_then(|sealed| Ok(master.open(&self.credential_aad(agent), &sealed)?))
-            .wrap_err_with(|| {
-                format!(
-                    "opening the discovery credential of agent {agent}: is EDGE_MASTER_KEY the \
-                     key it was sealed under?"
-                )
+    /// Open every sealed credential inside an agent's JSON back into the
+    /// string the agent struct expects. A sealed value with no key to open it
+    /// is an error, not a silently empty credential.
+    fn open_credentials(&self, agent: &str, config: &mut serde_json::Value) -> Result<()> {
+        for (pointer, field, server) in Self::credential_slots(config) {
+            let Some(slot) = config.pointer_mut(&pointer) else {
+                continue;
+            };
+            let Some(encoded) = slot.get(SEALED).and_then(|sealed| sealed.as_str()) else {
+                continue;
+            };
+            let Some(master) = &self.master else {
+                return Err(eyre!(
+                    "agent {agent} holds a sealed discovery credential (server {server}) but EDGE_MASTER_KEY is not set"
+                ));
+            };
+            let opened = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| eyre!("malformed sealed credential"))
+                .and_then(|bytes| Ok(Sealed::from_bytes(&bytes)?))
+                .and_then(|sealed| Ok(master.open(&self.credential_aad(agent, &field), &sealed)?))
+                .wrap_err_with(|| {
+                    format!(
+                        "opening the discovery credential of agent {agent} (server {server}): is \
+                         EDGE_MASTER_KEY the key it was sealed under?"
+                    )
+                })?;
+            let cleartext = String::from_utf8(opened.to_vec()).wrap_err_with(|| {
+                format!("the discovery credential of agent {agent} (server {server}) is not text")
             })?;
-        let cleartext = String::from_utf8(opened.to_vec())
-            .wrap_err_with(|| format!("the discovery credential of agent {agent} is not text"))?;
-        *field = serde_json::Value::String(cleartext);
+            *slot = serde_json::Value::String(cleartext);
+        }
         Ok(())
     }
 
@@ -157,7 +181,7 @@ impl EdgeConfigStore {
         for row in rows {
             let id: String = row.get(0);
             let mut json: serde_json::Value = row.get(1);
-            self.open_credential(&id, &mut json)?;
+            self.open_credentials(&id, &mut json)?;
             let agent: EdgeAgent = serde_json::from_value(json)
                 .wrap_err("decoding a stored agent config (schema drift?)")?;
             out.push(agent);
@@ -168,7 +192,7 @@ impl EdgeConfigStore {
     /// Insert or replace one agent.
     pub async fn upsert(&self, agent: &EdgeAgent) -> Result<()> {
         let mut json = serde_json::to_value(agent).wrap_err("encoding agent config")?;
-        self.seal_credential(&agent.id, &mut json)?;
+        self.seal_credentials(&agent.id, &mut json)?;
         let conn = self.pool.conn(&self.tenant).await?;
         conn.execute(
             "INSERT INTO edge_agents (tenant_id, id, config, updated_at) \
@@ -751,6 +775,7 @@ mod tests {
                 mcp: Some(crate::agent::McpSettings {
                     url: "https://mcp.example".into(),
                     discovery_credential: Some(credential.into()),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -849,6 +874,133 @@ mod tests {
                 raw_credential(&pool, "toolless").await,
                 serde_json::Value::Null
             );
+        })
+        .await;
+    }
+
+    fn agent_with_servers(id: &str) -> EdgeAgent {
+        let server = |id: &str| crate::agent::McpServerSettings {
+            id: id.into(),
+            connection: crate::agent::McpSettings {
+                url: format!("https://{id}.example.test/mcp"),
+                discovery_credential: Some(format!("{id}-secret")),
+                ..Default::default()
+            },
+            allowed_tools: vec![format!("{id}.*")],
+            ..Default::default()
+        };
+        let mut agent = agent_with_credential(id, "primary-secret");
+        agent.embed.mcp_servers = vec![server("docs"), server("billing")];
+        agent
+    }
+
+    async fn raw_config(pool: &PostgresPool, id: &str) -> serde_json::Value {
+        pool.get()
+            .await
+            .unwrap()
+            .query_one("SELECT config FROM edge_agents WHERE id = $1", &[&id])
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// Every server's credential is sealed in place and opens on load; the
+    /// primary's seal is bound exactly as before.
+    #[tokio::test]
+    async fn an_additional_servers_credential_is_sealed_and_opens_on_load() {
+        with_test_pool(PostgresSessionStore::build_pool, |pool| async move {
+            run_session_migrations(&pool).await.unwrap();
+            run_edge_migrations(&pool).await.unwrap();
+            let store = EdgeConfigStore::new(
+                TenantPool::new(pool.clone()),
+                TenantId::default_tenant(),
+                Some(crate::settings::tests::test_master_key()),
+            );
+            store.upsert(&agent_with_servers("support")).await.unwrap();
+            let raw = raw_config(&pool, "support").await;
+            for pointer in [
+                "/embed/mcp/discovery_credential",
+                "/embed/mcp_servers/0/discovery_credential",
+                "/embed/mcp_servers/1/discovery_credential",
+            ] {
+                assert!(
+                    raw.pointer(pointer).unwrap().get("sealed").is_some(),
+                    "{pointer}"
+                );
+            }
+            assert!(!raw.to_string().contains("-secret"), "{raw}");
+            let loaded = store.load_all().await.unwrap();
+            let credentials: Vec<Option<&str>> = loaded[0]
+                .embed
+                .mcp_server_specs()
+                .iter()
+                .map(|s| s.connection.discovery_credential.as_deref())
+                .collect();
+            assert_eq!(
+                credentials,
+                [
+                    Some("primary-secret"),
+                    Some("docs-secret"),
+                    Some("billing-secret")
+                ]
+            );
+        })
+        .await;
+    }
+
+    /// A seal opens only for the server it was made for: reordering servers
+    /// keeps every credential, while a blob moved to another server fails to
+    /// open and the error names that server.
+    #[tokio::test]
+    async fn a_sealed_credential_is_bound_to_its_server_id() {
+        with_test_pool(PostgresSessionStore::build_pool, |pool| async move {
+            run_session_migrations(&pool).await.unwrap();
+            run_edge_migrations(&pool).await.unwrap();
+            let store = EdgeConfigStore::new(
+                TenantPool::new(pool.clone()),
+                TenantId::default_tenant(),
+                Some(crate::settings::tests::test_master_key()),
+            );
+            store.upsert(&agent_with_servers("support")).await.unwrap();
+            let mut raw = raw_config(&pool, "support").await;
+            let write = |raw: serde_json::Value| {
+                let pool = pool.clone();
+                async move {
+                    pool.get()
+                        .await
+                        .unwrap()
+                        .execute(
+                            "UPDATE edge_agents SET config = $1 WHERE id = 'support'",
+                            &[&raw],
+                        )
+                        .await
+                        .unwrap();
+                }
+            };
+
+            raw["embed"]["mcp_servers"]
+                .as_array_mut()
+                .unwrap()
+                .reverse();
+            write(raw.clone()).await;
+            let loaded = store.load_all().await.unwrap();
+            assert_eq!(loaded[0].embed.mcp_servers[0].id, "billing");
+            assert_eq!(
+                loaded[0].embed.mcp_servers[0]
+                    .connection
+                    .discovery_credential
+                    .as_deref(),
+                Some("billing-secret"),
+                "reordering keeps every seal openable"
+            );
+
+            let servers = raw["embed"]["mcp_servers"].as_array_mut().unwrap();
+            let moved = servers[0]["discovery_credential"].clone();
+            servers[0]["discovery_credential"] = servers[1]["discovery_credential"].clone();
+            servers[1]["discovery_credential"] = moved;
+            write(raw).await;
+            let err = format!("{:#}", store.load_all().await.unwrap_err());
+            assert!(err.contains("server billing"), "{err}");
         })
         .await;
     }

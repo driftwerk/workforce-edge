@@ -146,11 +146,17 @@ pub struct EmbedSettings {
     /// test install on Google OIDC, where anyone has an account).
     #[serde(default)]
     pub allowed_emails: Vec<String>,
-    /// The company MCP server this agent acts against, as the customer. Optional:
-    /// an agent with no MCP is a pure-chat agent (no tools), so the edge can run
-    /// on installs that have no MCP server at all.
+    /// The primary company MCP server this agent acts against, as the customer;
+    /// `allowed_tools` and `tool_grants` are its allowlist and write tiers.
+    /// Optional: an agent with no MCP is a pure-chat agent (no tools), so the
+    /// edge can run on installs that have no MCP server at all.
     #[serde(default)]
     pub mcp: Option<McpSettings>,
+    /// MCP servers used alongside the primary, each with its own connection,
+    /// allowlist and write tiers. Needs the primary. Every server's tool names
+    /// must be distinct from every other's on the wire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServerSettings>,
     /// Cosmetic widget branding.
     #[serde(default)]
     pub branding: Branding,
@@ -251,42 +257,148 @@ pub struct EmbedSettings {
 }
 
 impl EmbedSettings {
-    /// The tools this user may be offered: the base `allowed_tools` plus the
-    /// tools from every grant the user satisfies. `is_granted` is supplied by the
-    /// session layer (which knows the user's resolved capabilities per source),
-    /// keeping this pure and unit-testable. Grant tools already in the base
-    /// allowlist are not duplicated.
+    /// The primary's tools, then each additional server's.
+    fn tool_sets(&self) -> impl Iterator<Item = ToolSet<'_>> {
+        std::iter::once(ToolSet {
+            allowed_tools: &self.allowed_tools,
+            tool_grants: &self.tool_grants,
+        })
+        .chain(self.mcp_servers.iter().map(McpServerSettings::tools))
+    }
+
+    /// The tools this user may be offered: every server's base allowlist plus
+    /// the tools from every grant the user satisfies. `is_granted` is supplied
+    /// by the session layer (which knows the user's resolved capabilities per
+    /// source), keeping this pure and unit-testable.
     pub fn effective_allowed_tools(&self, is_granted: impl Fn(&ToolGrant) -> bool) -> Vec<String> {
-        let mut tools = self.allowed_tools.clone();
-        for grant in &self.tool_grants {
-            if is_granted(grant) {
-                for t in &grant.tools {
-                    if !tools.iter().any(|x| x == t) {
-                        tools.push(t.clone());
-                    }
+        self.tool_sets()
+            .flat_map(|set| set.effective(&is_granted))
+            .collect()
+    }
+
+    /// Every server's grants, the primary's first.
+    pub fn all_tool_grants(&self) -> impl Iterator<Item = &ToolGrant> {
+        self.tool_sets().flat_map(|set| set.tool_grants.iter())
+    }
+
+    /// Whether `tool` is a write-tier tool on some server (unlocked only by a
+    /// grant there, not part of that server's base allowlist) — used to decide
+    /// whether the confirmation policy and per-user gating apply to it.
+    pub fn is_granted_tool(&self, tool: &str) -> bool {
+        self.tool_sets().any(|set| set.grants_tool(tool))
+    }
+
+    /// Whether any server's base allowlist admits `tool`.
+    pub fn any_server_admits(&self, tool: &str) -> bool {
+        self.tool_sets()
+            .any(|set| allowlist_admits(set.allowed_tools, tool))
+    }
+
+    /// The primary server first, then the additional ones in declared order.
+    pub fn mcp_server_specs(&self) -> Vec<McpServerSpec<'_>> {
+        let primary_tools = ToolSet {
+            allowed_tools: &self.allowed_tools,
+            tool_grants: &self.tool_grants,
+        };
+        self.mcp
+            .iter()
+            .map(|mcp| McpServerSpec::new(PRIMARY_MCP_ID, mcp, None, primary_tools, true))
+            .chain(self.mcp_servers.iter().map(|s| {
+                McpServerSpec::new(
+                    &s.id,
+                    &s.connection,
+                    s.tool_prefix.as_deref(),
+                    s.tools(),
+                    false,
+                )
+            }))
+            .collect()
+    }
+
+    /// Every static rule over the agent's servers; `Err` names the field to
+    /// fix. Runs on every build path, so it checks only what a config written
+    /// before additional servers existed cannot contain: an existing
+    /// single-server config never starts failing here.
+    pub fn check_mcp_servers(&self) -> Result<(), String> {
+        if self.mcp.is_none() && !self.mcp_servers.is_empty() {
+            return Err(
+                "mcp_servers need the primary server: set mcp before adding more servers"
+                    .to_string(),
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for server in &self.mcp_servers {
+            let field = format!("mcp_servers[{}]", server.id);
+            if !valid_id(&server.id) {
+                return Err(format!(
+                    "{field}.id must be 1–64 chars of lowercase letters, digits, or dashes"
+                ));
+            }
+            if server.id == PRIMARY_MCP_ID {
+                return Err(format!(
+                    "{field}.id: {PRIMARY_MCP_ID:?} names the primary server"
+                ));
+            }
+            if !seen.insert(server.id.as_str()) {
+                return Err(format!("{field}.id is used by more than one server"));
+            }
+            if let Some(prefix) = server.tool_prefix.as_deref() {
+                if !valid_tool_prefix(prefix) {
+                    return Err(format!(
+                        "{field}.tool_prefix must be 1–32 chars of lowercase letters, digits, '_' or '-'"
+                    ));
+                }
+            }
+            if server.allowed_tools.is_empty() {
+                return Err(format!("{field}.allowed_tools must name at least one tool"));
+            }
+            check_tool_grants(&format!("{field}.tool_grants"), &server.tool_grants)?;
+            if let Some(prefix) = server.tool_prefix.as_deref() {
+                let inside = format!("{prefix}.");
+                if let Some(entry) = server
+                    .tools()
+                    .catalogue()
+                    .into_iter()
+                    .find(|e| !e.starts_with(&inside))
+                {
+                    return Err(format!(
+                        "{field}: {entry:?} can never match; this server's tools are named {prefix}.<tool>"
+                    ));
                 }
             }
         }
-        tools
+        let specs = self.mcp_server_specs();
+        specs.iter().try_for_each(McpServerSpec::check_connection)?;
+        specs
+            .iter()
+            .enumerate()
+            .flat_map(|(i, a)| specs[i + 1..].iter().map(move |b| (a, b)))
+            .find_map(|(a, b)| a.overlap_with(b))
+            .map_or(Ok(()), Err)
     }
 
-    /// The full set of tools that must be DISCOVERED from the MCP server for this
-    /// agent: the base allowlist plus every tool any grant could unlock. The
-    /// per-turn layer then narrows this to a specific user's effective set. With
-    /// no grants this is exactly `allowed_tools` (historical behaviour).
-    pub fn discoverable_tools(&self) -> Vec<String> {
-        self.effective_allowed_tools(|_| true)
+    /// Drop every server's discovery credential, for a revision snapshot.
+    pub fn strip_credentials(&mut self) {
+        self.mcp
+            .iter_mut()
+            .chain(self.mcp_servers.iter_mut().map(|s| &mut s.connection))
+            .for_each(|c| c.discovery_credential = None);
     }
 
-    /// Whether `tool` is a write-tier tool (unlocked only by a grant, not part of
-    /// the base allowlist) — used to decide whether the confirmation policy and
-    /// per-user gating apply to it.
-    pub fn is_granted_tool(&self, tool: &str) -> bool {
-        !self.tool_allowed(tool)
-            && self
-                .tool_grants
-                .iter()
-                .any(|g| g.tools.iter().any(|t| t == tool))
+    /// Re-attach `live`'s credentials to the servers that still point where
+    /// they did: the primary by URL, each additional server by id and URL.
+    pub fn adopt_credentials(&mut self, live: &EmbedSettings) {
+        if let Some(mcp) = self.mcp.as_mut() {
+            mcp.adopt_credential(live.mcp.as_ref());
+        }
+        for server in &mut self.mcp_servers {
+            server.connection.adopt_credential(
+                live.mcp_servers
+                    .iter()
+                    .find(|l| l.id == server.id)
+                    .map(|l| &l.connection),
+            );
+        }
     }
 
     /// Whether granted write tiers require an enforced in-chat confirmation.
@@ -524,16 +636,62 @@ pub fn allowlist_admits(entries: &[String], tool: &str) -> bool {
     })
 }
 
-/// The one company MCP server an edge agent connects to.
-#[derive(Clone, Serialize, Deserialize)]
+/// The id the primary `[embed.mcp]` server goes by in logs and messages, and
+/// which no additional server may take.
+pub const PRIMARY_MCP_ID: &str = "default";
+
+/// How long a server that is not required is skipped after its turn start
+/// timed out, when it names no window of its own.
+pub const DEFAULT_UNAVAILABLE_SKIP_SECS: u64 = 60;
+
+/// How a server's tool calls authenticate as the customer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAuth {
+    /// The turn's `[token_exchange]` token for this server's audience, or the
+    /// customer's own token when exchange is off or fails.
+    #[default]
+    Exchanged,
+    /// Always the customer's own token.
+    Forwarded,
+}
+
+impl McpAuth {
+    pub fn is_exchanged(&self) -> bool {
+        *self == Self::Exchanged
+    }
+}
+
+/// A company MCP server's connection: the primary `[embed.mcp]` block, and the
+/// connection half of every `[[embed.mcp_servers]]` entry. Every field past the
+/// credential is skipped at its default, so a config that sets none of them
+/// serialises exactly as before they existed.
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct McpSettings {
     /// Base URL of the company MCP server.
     pub url: String,
     /// Optional service-account credential used only to discover the server's
-    /// tool list at startup; per-customer calls forward the customer's own
-    /// token instead.
+    /// tool list at startup; per-customer calls carry the customer's own token
+    /// instead.
     #[serde(default)]
     pub discovery_credential: Option<String>,
+    #[serde(default, skip_serializing_if = "McpAuth::is_exchanged")]
+    pub auth: McpAuth,
+    /// The audience the customer's token is exchanged for, for this server
+    /// alone, so a token minted for it is not accepted by another server.
+    /// `None` ⇒ `[token_exchange].audience`. Only with `auth = "exchanged"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    /// Whether this server being unavailable fails startup and the turn
+    /// (`true`), or only removes its tools for the turn (`false`). `None` ⇒
+    /// `true` for the primary server, `false` for an additional one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// How long a server that is not required is skipped after its turn start
+    /// timed out, so a stalled server does not slow every turn. `None` ⇒
+    /// [`DEFAULT_UNAVAILABLE_SKIP_SECS`]; `0` ⇒ never skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_skip_secs: Option<u64>,
 }
 
 impl McpSettings {
@@ -544,6 +702,14 @@ impl McpSettings {
             .as_deref()
             .is_some_and(|c| !c.is_empty())
     }
+
+    /// Take the live credential when `live` still points where this does, so
+    /// a secret never follows a server to another URL.
+    fn adopt_credential(&mut self, live: Option<&McpSettings>) {
+        self.discovery_credential = live
+            .filter(|l| l.url == self.url)
+            .and_then(|l| l.discovery_credential.clone());
+    }
 }
 
 // Manual Debug so the discovery credential never lands in a debug log.
@@ -552,8 +718,239 @@ impl std::fmt::Debug for McpSettings {
         f.debug_struct("McpSettings")
             .field("url", &self.url)
             .field("has_discovery_credential", &self.has_discovery_credential())
+            .field("auth", &self.auth)
+            .field("audience", &self.audience)
+            .field("required", &self.required)
+            .field("unavailable_skip_secs", &self.unavailable_skip_secs)
             .finish()
     }
+}
+
+/// An MCP server an agent uses alongside its primary `[embed.mcp]`, with its
+/// own allowlist and write tiers. `Debug` goes through [`McpSettings`]'s, so it
+/// never prints the credential either.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpServerSettings {
+    /// Stable id: names the server in logs, the admin API and the sealed
+    /// credential. Same grammar as an agent id; `default` is the primary's.
+    pub id: String,
+    #[serde(flatten)]
+    pub connection: McpSettings,
+    /// Exposes every tool as `<prefix>.<tool>`, so two servers that both have a
+    /// `search` tool can both be used. `tools/call` still sends the raw name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_prefix: Option<String>,
+    /// This server's closed allowlist, in the names the agent sees (prefix
+    /// included). Must name at least one tool.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Per-user write tiers on this server, exactly like
+    /// [`EmbedSettings::tool_grants`] for the primary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_grants: Vec<ToolGrant>,
+}
+
+impl McpServerSettings {
+    pub fn tools(&self) -> ToolSet<'_> {
+        ToolSet {
+            allowed_tools: &self.allowed_tools,
+            tool_grants: &self.tool_grants,
+        }
+    }
+}
+
+/// One server's tools: its base allowlist and the write tiers on top. The one
+/// place that knows how a server's tools resolve for a user.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolSet<'a> {
+    pub allowed_tools: &'a [String],
+    pub tool_grants: &'a [ToolGrant],
+}
+
+impl ToolSet<'_> {
+    /// The base allowlist plus the tools of every grant `is_granted` admits,
+    /// without duplicates.
+    pub fn effective(&self, is_granted: impl Fn(&ToolGrant) -> bool) -> Vec<String> {
+        self.tool_grants
+            .iter()
+            .filter(|g| is_granted(g))
+            .flat_map(|g| &g.tools)
+            .fold(self.allowed_tools.to_vec(), |mut tools, t| {
+                if !tools.contains(t) {
+                    tools.push(t.clone());
+                }
+                tools
+            })
+    }
+
+    /// Everything this server must DISCOVER: the base plus every tool any grant
+    /// could unlock. The per-turn layer narrows it to one user's effective set.
+    pub fn catalogue(&self) -> Vec<String> {
+        self.effective(|_| true)
+    }
+
+    /// Whether `tool` is a write-tier tool here: named by a grant and not
+    /// admitted by the base allowlist.
+    pub fn grants_tool(&self, tool: &str) -> bool {
+        !allowlist_admits(self.allowed_tools, tool)
+            && self
+                .tool_grants
+                .iter()
+                .any(|g| g.tools.iter().any(|t| t == tool))
+    }
+}
+
+/// One MCP server as every consumer sees it, primary and additional alike.
+#[derive(Debug, Clone)]
+pub struct McpServerSpec<'a> {
+    pub id: &'a str,
+    pub connection: &'a McpSettings,
+    pub tool_prefix: Option<&'a str>,
+    pub tools: ToolSet<'a>,
+    /// Whether this server being unavailable fails startup and the turn.
+    pub required: bool,
+    primary: bool,
+}
+
+impl<'a> McpServerSpec<'a> {
+    fn new(
+        id: &'a str,
+        connection: &'a McpSettings,
+        tool_prefix: Option<&'a str>,
+        tools: ToolSet<'a>,
+        primary: bool,
+    ) -> Self {
+        Self {
+            id,
+            connection,
+            tool_prefix,
+            tools,
+            required: connection.required.unwrap_or(primary),
+            primary,
+        }
+    }
+
+    /// How long this server is skipped after a timed-out turn start.
+    pub fn unavailable_skip(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.connection
+                .unavailable_skip_secs
+                .unwrap_or(DEFAULT_UNAVAILABLE_SKIP_SECS),
+        )
+    }
+
+    /// The config path this server's fields live under, for error messages.
+    fn field(&self) -> String {
+        if self.primary {
+            "mcp".to_string()
+        } else {
+            format!("mcp_servers[{}]", self.id)
+        }
+    }
+
+    fn check_connection(&self) -> Result<(), String> {
+        let field = self.field();
+        match (self.connection.audience.as_deref(), self.connection.auth) {
+            (Some(a), _) if a.trim().is_empty() => {
+                return Err(format!("{field}.audience must not be blank"))
+            }
+            (Some(_), McpAuth::Forwarded) => {
+                return Err(format!(
+                    "{field}.audience applies only to auth = \"exchanged\"; a forwarded server gets the customer's own token"
+                ))
+            }
+            _ => {}
+        }
+        if self.required && self.connection.unavailable_skip_secs.is_some() {
+            return Err(format!(
+                "{field}.unavailable_skip_secs applies only to a server that is not required; a required server is never skipped"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The first pair of entries by which `other`'s catalogue could collide
+    /// with this one's on the wire, as the message naming both.
+    fn overlap_with(&self, other: &Self) -> Option<String> {
+        let (mine, theirs) = (self.tools.catalogue(), other.tools.catalogue());
+        mine.iter()
+            .flat_map(|a| theirs.iter().map(move |b| (a, b)))
+            .find(|(a, b)| ToolPattern::parse(a).overlaps(&ToolPattern::parse(b)))
+            .map(|(a, b)| {
+                format!(
+                    "{}: {b:?} overlaps {a:?} on server {}; tool names must be distinct across servers (a tool_prefix separates them)",
+                    other.field(),
+                    self.id
+                )
+            })
+    }
+}
+
+/// An allowlist entry in LLM-name space (`.` → `_`), where two servers' tools
+/// collide: an exact name, or a `prefix.*` namespace.
+enum ToolPattern {
+    Exact(String),
+    Namespace(String),
+}
+
+impl ToolPattern {
+    fn parse(entry: &str) -> Self {
+        let to_llm = workforce_agent::runner::to_llm_name;
+        match entry.strip_suffix(".*") {
+            Some(prefix) => Self::Namespace(to_llm(prefix)),
+            None => Self::Exact(to_llm(entry)),
+        }
+    }
+
+    /// Conservative: whether any name could match both. `_` stands in for the
+    /// `.` a namespace match needs, because on the wire the two are one.
+    fn overlaps(&self, other: &Self) -> bool {
+        let within = |name: &str, namespace: &str| {
+            name == namespace
+                || name
+                    .strip_prefix(namespace)
+                    .is_some_and(|rest| rest.starts_with('_'))
+        };
+        match (self, other) {
+            (Self::Exact(a), Self::Exact(b)) => a == b,
+            (Self::Exact(name), Self::Namespace(ns)) | (Self::Namespace(ns), Self::Exact(name)) => {
+                within(name, ns)
+            }
+            (Self::Namespace(a), Self::Namespace(b)) => within(a, b) || within(b, a),
+        }
+    }
+}
+
+/// A slug-safe id — lowercase letters, digits and dashes, 1..64 chars — for an
+/// agent (a session namespace and memory owner scope) or an MCP server.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn valid_tool_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix.len() <= 32
+        && prefix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// Shape checks on a list of grants found at `field`: each needs the
+/// capability it requires and at least one tool to unlock.
+pub fn check_tool_grants(field: &str, grants: &[ToolGrant]) -> Result<(), String> {
+    grants.iter().enumerate().try_for_each(|(i, grant)| {
+        if grant.requires.trim().is_empty() {
+            Err(format!("{field}[{i}] needs the capability it requires"))
+        } else if grant.tools.is_empty() {
+            Err(format!("{field}[{i}] must unlock at least one tool"))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 /// Per-install widget theme. Every field is optional; the loader applies safe
@@ -873,31 +1270,12 @@ mod tests {
         EmbedSettings {
             allowed_origins: origins.iter().map(|s| s.to_string()).collect(),
             allowed_tools: tools.iter().map(|s| s.to_string()).collect(),
-            allowed_emails: vec![],
             keycloak_issuer: "https://kc/realms/x".into(),
-            keycloak_audience: None,
             mcp: Some(McpSettings {
                 url: "http://mcp".into(),
-                discovery_credential: None,
+                ..Default::default()
             }),
-            branding: Branding::default(),
-            passive_memory: None,
-            data_tables: None,
-            charts: None,
-            forms: None,
-            maps: None,
-            diagrams: None,
-            excalidraw_export: None,
-            uploads: vec![],
-            upload_max_mb: None,
-            drawing: None,
-            inline_images: None,
-            images: None,
-            image_hosts: vec![],
-            spill_skip_tools: vec![],
-            tool_grants: vec![],
-            permissions: None,
-            policy: None,
+            ..Default::default()
         }
     }
 
@@ -951,13 +1329,13 @@ mod tests {
     }
 
     #[test]
-    fn discoverable_tools_is_the_union_of_base_and_all_grants() {
+    fn the_primary_catalogue_is_the_union_of_base_and_all_grants() {
         let mut e = embed(&[], &["read_a"]);
         e.tool_grants = vec![
             grant("items:edit", &["write_item"]),
             grant("pickups:edit", &["write_pickup"]),
         ];
-        let d = e.discoverable_tools();
+        let d = e.mcp_server_specs()[0].tools.catalogue();
         assert!(d.contains(&"read_a".to_string()));
         assert!(d.contains(&"write_item".to_string()));
         assert!(d.contains(&"write_pickup".to_string()));
@@ -1124,6 +1502,7 @@ requires = "admin""#,
         let mcp = McpSettings {
             url: "https://mcp.example.test".into(),
             discovery_credential: Some("svc-secret-7".into()),
+            ..Default::default()
         };
         let printed = format!("{mcp:?}");
         assert!(!printed.contains("svc-secret-7"), "{printed}");
@@ -1258,5 +1637,389 @@ mod image_config_tests {
         assert!(!embed.images_enabled());
         assert!(!embed.image_fetch_enabled());
         assert!(embed.image_hosts.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mcp_server_tests {
+    use super::*;
+
+    fn names(tools: &[&str]) -> Vec<String> {
+        tools.iter().map(|t| t.to_string()).collect()
+    }
+
+    fn primary(tools: &[&str]) -> EmbedSettings {
+        EmbedSettings {
+            keycloak_issuer: "https://kc.example.test/realms/x".into(),
+            allowed_tools: names(tools),
+            mcp: Some(McpSettings {
+                url: "https://mcp.harbor.example".into(),
+                discovery_credential: Some("primary-secret".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn server(id: &str, prefix: Option<&str>, tools: &[&str]) -> McpServerSettings {
+        McpServerSettings {
+            id: id.into(),
+            connection: McpSettings {
+                url: format!("https://{id}-mcp.harbor.example/mcp"),
+                discovery_credential: Some(format!("{id}-secret")),
+                ..Default::default()
+            },
+            tool_prefix: prefix.map(str::to_string),
+            allowed_tools: names(tools),
+            tool_grants: vec![],
+        }
+    }
+
+    fn grant(requires: &str, tools: &[&str]) -> ToolGrant {
+        ToolGrant {
+            source: GrantSource::BackendPermissions,
+            requires: requires.into(),
+            tools: names(tools),
+        }
+    }
+
+    fn refused(embed: &EmbedSettings) -> String {
+        embed.check_mcp_servers().expect_err("must be refused")
+    }
+
+    /// The serialised form of a config that names none of the new keys is
+    /// exactly what it was before they existed — stored rows, revisions and
+    /// admin JSON all compare equal.
+    #[test]
+    fn an_embed_without_additional_servers_serialises_as_before() {
+        let legacy = primary(&["harbor.*"]);
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("mcp_servers").is_none(), "{json}");
+        assert_eq!(
+            json["mcp"],
+            serde_json::json!({"url": "https://mcp.harbor.example", "discovery_credential": "primary-secret"})
+        );
+        let toml_text = toml::to_string(&legacy).unwrap();
+        assert!(!toml_text.contains("mcp_servers"), "{toml_text}");
+        let back: EmbedSettings = toml::from_str(&toml_text).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+        let reparsed: EmbedSettings = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&reparsed).unwrap(), json);
+    }
+
+    #[test]
+    fn additional_servers_parse_with_defaults() {
+        let embed: EmbedSettings = toml::from_str(
+            r#"
+            keycloak_issuer = "https://kc.example.test/realms/x"
+            allowed_tools = ["harbor.*"]
+
+            [mcp]
+            url = "https://mcp.harbor.example"
+
+            [[mcp_servers]]
+            id = "docs"
+            url = "https://docs-mcp.harbor.example/mcp"
+            tool_prefix = "docs"
+            allowed_tools = ["docs.*"]
+            audience = "docs-mcp"
+            unavailable_skip_secs = 15
+            tool_grants = [{ requires = "docs:edit", tools = ["docs.edit_page"] }]
+
+            [[mcp_servers]]
+            id = "billing"
+            url = "https://billing-mcp.harbor.example/mcp"
+            auth = "forwarded"
+            required = true
+            discovery_credential = "billing-secret"
+            allowed_tools = ["billing.list_invoices"]
+            "#,
+        )
+        .unwrap();
+        let [docs, billing] = embed.mcp_servers.as_slice() else {
+            panic!("two servers: {:?}", embed.mcp_servers);
+        };
+        assert_eq!(docs.connection.auth, McpAuth::Exchanged);
+        assert_eq!(docs.connection.audience.as_deref(), Some("docs-mcp"));
+        assert_eq!(docs.connection.unavailable_skip_secs, Some(15));
+        assert_eq!(docs.tool_grants[0].tools, names(&["docs.edit_page"]));
+        assert_eq!(billing.connection.auth, McpAuth::Forwarded);
+        assert_eq!(billing.connection.required, Some(true));
+        assert_eq!(
+            billing.connection.discovery_credential.as_deref(),
+            Some("billing-secret")
+        );
+        assert!(embed.check_mcp_servers().is_ok());
+
+        let json = serde_json::to_value(&embed).unwrap();
+        assert_eq!(
+            json["mcp_servers"][1]["discovery_credential"], "billing-secret",
+            "the credential sits flat in the server, where sealing looks"
+        );
+        let back: EmbedSettings = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+
+        let bad = toml::from_str::<EmbedSettings>(
+            r#"
+            keycloak_issuer = "k"
+            [[mcp_servers]]
+            id = "docs"
+            url = "https://docs.example.test"
+            auth = "bogus"
+            "#,
+        );
+        assert!(bad.is_err(), "an unknown auth mode is a parse error");
+    }
+
+    #[test]
+    fn server_specs_put_the_primary_first_with_its_grant_tools() {
+        let mut embed = primary(&["harbor.list_orders"]);
+        embed.tool_grants = vec![grant("orders:edit", &["harbor.cancel_order"])];
+        embed.mcp_servers = vec![
+            server("docs", Some("docs"), &["docs.*"]),
+            server("billing", None, &["billing.list_invoices"]),
+        ];
+        let specs = embed.mcp_server_specs();
+        let ids: Vec<&str> = specs.iter().map(|s| s.id).collect();
+        assert_eq!(ids, [PRIMARY_MCP_ID, "docs", "billing"]);
+        assert_eq!(
+            specs[0].tools.catalogue(),
+            names(&["harbor.list_orders", "harbor.cancel_order"])
+        );
+        assert_eq!(specs[1].tools.catalogue(), names(&["docs.*"]));
+        assert_eq!(
+            specs.iter().map(|s| s.required).collect::<Vec<_>>(),
+            [true, false, false]
+        );
+        assert_eq!(specs[0].connection.auth, McpAuth::Exchanged);
+        assert_eq!(specs[1].tool_prefix, Some("docs"));
+        assert_eq!(
+            specs[1].unavailable_skip(),
+            std::time::Duration::from_secs(DEFAULT_UNAVAILABLE_SKIP_SECS)
+        );
+
+        embed.mcp.as_mut().unwrap().required = Some(false);
+        embed.mcp_servers[1].connection.required = Some(true);
+        let specs = embed.mcp_server_specs();
+        assert_eq!(
+            specs.iter().map(|s| s.required).collect::<Vec<_>>(),
+            [false, false, true],
+            "required is chosen per server"
+        );
+    }
+
+    #[test]
+    fn tool_patterns_overlap_in_llm_name_space() {
+        let cases = [
+            ("crm.list", "crm.list", true),
+            ("crm.list", "crm.get", false),
+            ("crm.list", "crm_list", true),
+            ("crm.*", "crm.list", true),
+            ("crm.*", "crm", true),
+            ("crm.*", "crm_x.y", true),
+            ("crm.*", "crm.reports.*", true),
+            ("cr.*", "crm.*", false),
+            ("crm.*", "crmx.*", false),
+            ("crm.*", "crmx", false),
+        ];
+        for (a, b, overlap) in cases {
+            let (pa, pb) = (ToolPattern::parse(a), ToolPattern::parse(b));
+            assert_eq!(pa.overlaps(&pb), overlap, "{a} vs {b}");
+            assert_eq!(pb.overlaps(&pa), overlap, "{b} vs {a} (symmetry)");
+        }
+    }
+
+    #[test]
+    fn check_mcp_servers_refuses_each_misconfiguration() {
+        let with = |servers: Vec<McpServerSettings>| EmbedSettings {
+            mcp_servers: servers,
+            ..primary(&["harbor.*"])
+        };
+        let docs = || server("docs", Some("docs"), &["docs.*"]);
+
+        let mut orphan = with(vec![docs()]);
+        orphan.mcp = None;
+        assert!(
+            refused(&orphan).contains("need the primary"),
+            "{}",
+            refused(&orphan)
+        );
+
+        let dup = with(vec![docs(), server("docs", Some("pages"), &["pages.*"])]);
+        assert!(refused(&dup).contains("mcp_servers[docs].id is used by more than one"));
+
+        let reserved = with(vec![server(PRIMARY_MCP_ID, None, &["other.*"])]);
+        assert!(refused(&reserved).contains("names the primary server"));
+
+        let bad_id = with(vec![server("Docs Server", None, &["docs.*"])]);
+        assert!(refused(&bad_id).contains("mcp_servers[Docs Server].id must be"));
+
+        for prefix in ["a.b", "", &"p".repeat(33)] {
+            let e = with(vec![server("docs", Some(prefix), &["docs.*"])]);
+            assert!(
+                refused(&e).contains("mcp_servers[docs].tool_prefix"),
+                "{prefix:?}"
+            );
+        }
+
+        let empty = with(vec![server("docs", None, &[])]);
+        assert!(refused(&empty).contains("mcp_servers[docs].allowed_tools must name"));
+
+        let outside = with(vec![server("docs", Some("docs"), &["search"])]);
+        let e = refused(&outside);
+        assert!(
+            e.contains(r#"mcp_servers[docs]: "search" can never match"#)
+                && e.contains("docs.<tool>"),
+            "{e}"
+        );
+
+        let mut grant_outside = docs();
+        grant_outside.tool_grants = vec![grant("docs:edit", &["edit_page"])];
+        assert!(refused(&with(vec![grant_outside])).contains(r#""edit_page" can never match"#));
+
+        let mut blank_grant = docs();
+        blank_grant.tool_grants = vec![grant(" ", &["docs.edit_page"])];
+        assert!(refused(&with(vec![blank_grant]))
+            .contains("mcp_servers[docs].tool_grants[0] needs the capability"));
+
+        let base_overlap = with(vec![server("crm", None, &["harbor_list_orders"])]);
+        let e = refused(&base_overlap);
+        assert!(
+            e.contains(
+                r#"mcp_servers[crm]: "harbor_list_orders" overlaps "harbor.*" on server default"#
+            ),
+            "{e}"
+        );
+
+        let mut granted = primary(&["harbor.list_orders"]);
+        granted.tool_grants = vec![grant("orders:edit", &["harbor.cancel_order"])];
+        granted.mcp_servers = vec![server("crm", None, &["harbor_cancel_order"])];
+        assert!(refused(&granted).contains(r#""harbor.cancel_order" on server default"#));
+
+        let two = with(vec![
+            server("crm", None, &["crm.*"]),
+            server("leads", None, &["crm.leads.list"]),
+        ]);
+        assert!(refused(&two)
+            .contains(r#"mcp_servers[leads]: "crm.leads.list" overlaps "crm.*" on server crm"#));
+
+        let mut forwarded_audience = docs();
+        forwarded_audience.connection.auth = McpAuth::Forwarded;
+        forwarded_audience.connection.audience = Some("docs-mcp".into());
+        assert!(refused(&with(vec![forwarded_audience]))
+            .contains("mcp_servers[docs].audience applies only to auth"));
+
+        let mut blank_audience = primary(&["harbor.*"]);
+        blank_audience.mcp.as_mut().unwrap().audience = Some("  ".into());
+        assert!(refused(&blank_audience).contains("mcp.audience must not be blank"));
+
+        let mut skipped_required = primary(&["harbor.*"]);
+        skipped_required.mcp.as_mut().unwrap().unavailable_skip_secs = Some(30);
+        assert!(refused(&skipped_required).contains("mcp.unavailable_skip_secs applies only"));
+        skipped_required.mcp.as_mut().unwrap().required = Some(false);
+        assert!(skipped_required.check_mcp_servers().is_ok());
+    }
+
+    #[test]
+    fn check_mcp_servers_accepts_disjoint_and_prefixed_servers() {
+        let mut embed = primary(&["search", "harbor.*"]);
+        embed.mcp_servers = vec![
+            server("docs", Some("docs"), &["docs.search", "docs.get_page"]),
+            server("wiki", Some("wiki"), &["wiki.*"]),
+            server("billing", None, &["billing.list_invoices"]),
+        ];
+        assert_eq!(embed.check_mcp_servers(), Ok(()));
+
+        let mut legacy = primary(&["anything", "x.*", "x_y", "  "]);
+        legacy.tool_grants = vec![grant(" ", &[])];
+        assert_eq!(
+            legacy.check_mcp_servers(),
+            Ok(()),
+            "with no additional servers nothing pre-existing is re-checked"
+        );
+        assert_eq!(EmbedSettings::default().check_mcp_servers(), Ok(()));
+    }
+
+    #[test]
+    fn grants_resolve_per_server() {
+        let mut embed = primary(&["harbor.list_orders"]);
+        embed.tool_grants = vec![grant("orders:edit", &["harbor.cancel_order"])];
+        let mut docs = server("docs", Some("docs"), &["docs.search"]);
+        docs.tool_grants = vec![ToolGrant {
+            source: GrantSource::KeycloakRole,
+            ..grant("editor", &["docs.edit_page"])
+        }];
+        embed.mcp_servers = vec![docs];
+
+        assert!(embed.is_granted_tool("harbor.cancel_order"));
+        assert!(embed.is_granted_tool("docs.edit_page"));
+        assert!(!embed.is_granted_tool("docs.search"));
+        assert_eq!(
+            embed
+                .all_tool_grants()
+                .map(|g| g.requires.as_str())
+                .collect::<Vec<_>>(),
+            ["orders:edit", "editor"]
+        );
+        let editor_only = embed.effective_allowed_tools(|g| g.requires == "editor");
+        assert_eq!(
+            editor_only,
+            names(&["harbor.list_orders", "docs.search", "docs.edit_page"])
+        );
+        assert_eq!(
+            embed.mcp_server_specs()[1].tools.catalogue(),
+            names(&["docs.search", "docs.edit_page"])
+        );
+        assert!(embed.any_server_admits("docs.search"));
+        assert!(!embed.any_server_admits("docs.edit_page"));
+    }
+
+    #[test]
+    fn strip_and_adopt_credentials_cover_every_server() {
+        let mut live = primary(&["harbor.*"]);
+        live.mcp_servers = vec![
+            server("docs", Some("docs"), &["docs.*"]),
+            server("billing", None, &["billing.*"]),
+        ];
+        let mut snapshot = live.clone();
+        snapshot.strip_credentials();
+        assert!(snapshot
+            .mcp_server_specs()
+            .iter()
+            .all(|s| s.connection.discovery_credential.is_none()));
+
+        snapshot.mcp_servers[1].connection.url = "https://moved.example.test/mcp".into();
+        snapshot.adopt_credentials(&live);
+        let credentials: Vec<Option<&str>> = snapshot
+            .mcp_server_specs()
+            .iter()
+            .map(|s| s.connection.discovery_credential.as_deref())
+            .collect();
+        assert_eq!(
+            credentials,
+            [Some("primary-secret"), Some("docs-secret"), None],
+            "a moved server keeps no credential"
+        );
+
+        let mut renamed = live.clone();
+        renamed.strip_credentials();
+        renamed.mcp_servers[0].id = "pages".into();
+        renamed.mcp.as_mut().unwrap().url = "https://elsewhere.example.test".into();
+        renamed.adopt_credentials(&live);
+        assert!(renamed.mcp.as_ref().unwrap().discovery_credential.is_none());
+        assert!(renamed.mcp_servers[0]
+            .connection
+            .discovery_credential
+            .is_none());
+    }
+
+    #[test]
+    fn server_settings_debug_never_prints_the_credential() {
+        let mut embed = primary(&["harbor.*"]);
+        embed.mcp_servers = vec![server("docs", None, &["docs.*"])];
+        let printed = format!("{embed:?}");
+        assert!(!printed.contains("primary-secret"), "{printed}");
+        assert!(!printed.contains("docs-secret"), "{printed}");
+        assert!(printed.contains("has_discovery_credential: true"));
     }
 }

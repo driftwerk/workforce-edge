@@ -66,6 +66,12 @@ impl TokenExchanger {
         self.policy
     }
 
+    /// The install's `[token_exchange].audience` — what a server that names
+    /// no audience of its own is exchanged for.
+    pub fn audience(&self) -> Option<&str> {
+        self.cfg.audience.as_deref()
+    }
+
     /// The issuer's token endpoint, as a URL.
     fn token_endpoint(&self) -> Result<Url> {
         Url::parse(&format!(
@@ -76,17 +82,17 @@ impl TokenExchanger {
     }
 
     /// Exchange `subject_token` (the customer's validated access token) for a
-    /// downstream access token at the PINNED issuer's token endpoint (never a
-    /// per-agent, admin-editable URL). Returns only the new access token —
-    /// per-turn re-exchange is the intended pattern, so no refresh token is
-    /// requested or stored.
-    pub async fn exchange(&self, subject_token: &str) -> Result<String> {
+    /// downstream access token scoped to `audience`, at the PINNED issuer's
+    /// token endpoint (never a per-agent, admin-editable URL). Returns only the
+    /// new access token — per-turn re-exchange is the intended pattern, so no
+    /// refresh token is requested or stored.
+    pub async fn exchange(&self, subject_token: &str, audience: Option<&str>) -> Result<String> {
         let url = self.token_endpoint()?;
         let client = outbound::client_for(self.policy, EXCHANGE_TIMEOUT, &url)
             .map_err(|e| eyre!("refusing the token exchange endpoint: {e}"))?;
         let resp = client
             .post(url)
-            .form(&form_params(&self.cfg, subject_token))
+            .form(&form_params(&self.cfg, subject_token, audience))
             .send()
             .await
             .map_err(|e| eyre!("token exchange request failed: {e}"))?;
@@ -117,12 +123,13 @@ impl TokenExchanger {
 }
 
 /// The RFC 8693 form body. Split out so the request shape is testable without
-/// an HTTP mock. `audience` rides only when configured (the MCP's Keycloak
+/// an HTTP mock. `audience` rides only when given (the MCP's Keycloak
 /// clientId); without it the exchanged token still gains a fresh TTL, just not
-/// the audience restriction. `scope` rides only when configured too.
+/// the audience restriction. `scope` rides only when configured.
 fn form_params<'a>(
     cfg: &'a TokenExchangeConfig,
     subject_token: &'a str,
+    audience: Option<&'a str>,
 ) -> Vec<(&'static str, &'a str)> {
     let mut params = vec![
         ("grant_type", GRANT_TYPE),
@@ -132,7 +139,7 @@ fn form_params<'a>(
         ("subject_token_type", TOKEN_TYPE_ACCESS),
         ("requested_token_type", TOKEN_TYPE_ACCESS),
     ];
-    if let Some(aud) = cfg.audience.as_deref() {
+    if let Some(aud) = audience {
         params.push(("audience", aud));
     }
     if let Some(scope) = cfg.scope.as_deref() {
@@ -157,8 +164,8 @@ mod tests {
 
     #[test]
     fn form_carries_rfc8693_fields_and_optional_audience() {
-        let c = cfg(Some("harbor-mcp"));
-        let params = form_params(&c, "subject-jwt");
+        let c = cfg(None);
+        let params = form_params(&c, "subject-jwt", Some("harbor-mcp"));
         let get = |k: &str| params.iter().find(|(pk, _)| *pk == k).map(|(_, v)| *v);
         assert_eq!(get("grant_type"), Some(GRANT_TYPE));
         assert_eq!(get("subject_token"), Some("subject-jwt"));
@@ -166,8 +173,7 @@ mod tests {
         assert_eq!(get("requested_token_type"), Some(TOKEN_TYPE_ACCESS));
         assert_eq!(get("audience"), Some("harbor-mcp"));
 
-        let plain = cfg(None);
-        let no_aud = form_params(&plain, "t");
+        let no_aud = form_params(&c, "t", None);
         assert!(no_aud.iter().all(|(k, _)| *k != "audience"));
     }
 
@@ -177,11 +183,13 @@ mod tests {
             scope: Some("openid".into()),
             ..cfg(None)
         };
-        let params = form_params(&scoped, "t");
+        let params = form_params(&scoped, "t", None);
         assert!(params.contains(&("scope", "openid")));
 
         let plain = cfg(None);
-        assert!(form_params(&plain, "t").iter().all(|(k, _)| *k != "scope"));
+        assert!(form_params(&plain, "t", None)
+            .iter()
+            .all(|(k, _)| *k != "scope"));
     }
 
     fn cfg_at(issuer: &str) -> TokenExchangeConfig {
@@ -214,7 +222,7 @@ mod tests {
         let exchanger = TokenExchanger::new(cfg_at(&format!("{}/realms/r", server.uri())));
         assert_eq!(exchanger.policy(), OutboundPolicy::Private);
         assert_eq!(
-            exchanger.exchange("subject-jwt").await.unwrap(),
+            exchanger.exchange("subject-jwt", None).await.unwrap(),
             "down.stream"
         );
     }
@@ -229,7 +237,7 @@ mod tests {
             OutboundPolicy::Public,
         );
         let err = exchanger
-            .exchange("subject-jwt")
+            .exchange("subject-jwt", None)
             .await
             .unwrap_err()
             .to_string();

@@ -120,6 +120,7 @@ mod tests {
             keycloak_issuer: "https://kc".into(),
             keycloak_audience: None,
             mcp: None::<McpSettings>,
+            mcp_servers: vec![],
             branding: Branding {
                 title: Some("Helper".into()),
                 primary_color: Some("#05405C".into()),
