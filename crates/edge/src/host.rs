@@ -2397,9 +2397,11 @@ fn turn_key(owner: &str, conversation: &str) -> String {
 /// at — describe the step in the user's terms ("Finding the right lookup",
 /// "Looking up orders") rather than surfacing internal vocabulary like "invoke
 /// query" (ENG-112); the invoked operation's domain comes from the call's
-/// detail summary, never its arguments or results. Any other tool shows its
-/// display name — namespace prefix dropped, separators spaced, first letter
-/// capitalised.
+/// detail summary, never its arguments or results. A direct MCP tool whose
+/// name contains one of the agent's label needles reads "Looking up {label}",
+/// or "Updating {label}" when its name says it writes. Any other tool shows
+/// its display name — namespace prefix dropped, separators spaced, first
+/// letter capitalised.
 fn progress_label(tool: &str, detail: &str, labels: &[ProgressLabel]) -> Option<String> {
     match tool {
         "playbook" => None,
@@ -2419,6 +2421,17 @@ fn progress_label(tool: &str, detail: &str, labels: &[ProgressLabel]) -> Option<
                 }
                 "invoke query" | "invoke operation" => Some(invoke_label(detail, labels)),
                 _ => {
+                    if let Some(label) = agent_label(name, labels) {
+                        // The first verb decides, so a server prefix
+                        // (`crm_create_lead`) doesn't hide it.
+                        let writes = words
+                            .iter()
+                            .map(|w| w.to_lowercase())
+                            .find(|w| READ_VERBS.contains(&&**w) || WRITE_VERBS.contains(&&**w))
+                            .is_some_and(|w| WRITE_VERBS.contains(&&*w));
+                        let verb = if writes { "Updating" } else { "Looking up" };
+                        return Some(format!("{verb} {label}"));
+                    }
                     let mut chars = display.chars();
                     let label = chars
                         .next()
@@ -2428,6 +2441,29 @@ fn progress_label(tool: &str, detail: &str, labels: &[ProgressLabel]) -> Option<
             }
         }
     }
+}
+
+/// The verbs a direct MCP tool's name starts with: one the agent's labels
+/// name reads "Looking up leads" for a read and "Updating leads" for a write.
+/// A name with neither reads as a lookup.
+const READ_VERBS: &[&str] = &[
+    "list", "get", "find", "search", "describe", "run", "download", "fetch", "read", "show",
+    "count",
+];
+const WRITE_VERBS: &[&str] = &[
+    "create", "update", "assign", "unassign", "close", "reopen", "send", "set", "retry", "add",
+    "remove", "delete", "cancel",
+];
+
+/// The agent's own label for `haystack` (a tool name or an invoked
+/// operation): the first whose needle it contains, case-insensitively.
+fn agent_label<'a>(haystack: &str, labels: &'a [ProgressLabel]) -> Option<&'a str> {
+    let haystack = haystack.to_lowercase();
+    labels
+        .iter()
+        .filter(|l| !l.needle.trim().is_empty())
+        .find(|l| haystack.contains(&l.needle.trim().to_lowercase()))
+        .map(|l| l.label.trim())
 }
 
 /// "Looking up orders", "Looking up the audit trail" — the invoked operation's
@@ -2452,11 +2488,7 @@ fn invoke_label(detail: &str, labels: &[ProgressLabel]) -> String {
         ("user", "user accounts"),
     ];
     let haystack = detail.to_lowercase();
-    labels
-        .iter()
-        .filter(|l| !l.needle.trim().is_empty())
-        .find(|l| haystack.contains(&l.needle.trim().to_lowercase()))
-        .map(|l| l.label.trim())
+    agent_label(detail, labels)
         .or_else(|| {
             DOMAINS
                 .iter()
@@ -4277,6 +4309,59 @@ prompt = "Confirm."
         assert_eq!(
             progress_label("acme_invoke_query", "ping", &labels).as_deref(),
             Some("Looking up your data")
+        );
+    }
+
+    #[test]
+    fn an_agents_labels_name_direct_mcp_tools_as_reads_or_writes() {
+        let labels = [
+            ProgressLabel {
+                needle: "lead".into(),
+                label: "leads".into(),
+            },
+            ProgressLabel {
+                needle: "quote".into(),
+                label: "quotes".into(),
+            },
+        ];
+        assert_eq!(
+            progress_label("list_leads", "", &labels).as_deref(),
+            Some("Looking up leads")
+        );
+        assert_eq!(
+            progress_label("get_quote", "", &labels).as_deref(),
+            Some("Looking up quotes")
+        );
+        assert_eq!(
+            progress_label("create_lead", "", &labels).as_deref(),
+            Some("Updating leads")
+        );
+        assert_eq!(
+            progress_label("Unassign_Lead", "", &labels).as_deref(),
+            Some("Updating leads")
+        );
+        // A server prefix doesn't hide the verb.
+        assert_eq!(
+            progress_label("crm_send_quote", "", &labels).as_deref(),
+            Some("Updating quotes")
+        );
+        assert_eq!(
+            progress_label("crm.list_quotes", "", &labels).as_deref(),
+            Some("Looking up quotes")
+        );
+        // No verb reads as a lookup; tools no label names keep their name.
+        assert_eq!(
+            progress_label("lead_history", "", &labels).as_deref(),
+            Some("Looking up leads")
+        );
+        assert_eq!(
+            progress_label("list_branches", "", &labels).as_deref(),
+            Some("Branches")
+        );
+        // Meta tools still go by the invoked operation, not their own name.
+        assert_eq!(
+            progress_label("lead_invoke_query", "getInvoice", &labels).as_deref(),
+            Some("Looking up invoices")
         );
     }
 
