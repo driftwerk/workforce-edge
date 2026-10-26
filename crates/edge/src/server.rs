@@ -9598,6 +9598,52 @@ mod tenant_tests {
         .await;
     }
 
+    /// Saving an optional server that never answers returns at once: its
+    /// static config is checked, its discovery is left to the background, and
+    /// the response claims nothing about its tools.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saving_a_blackholed_optional_server_does_not_wait_on_its_discovery() {
+        use workforce_common::session_postgres::PostgresSessionStore;
+        use workforce_postgres::test_support::with_test_pool;
+
+        with_test_pool(PostgresSessionStore::build_pool, |pool| async move {
+            let (state, _runtime, cookie) = agent_fixture(pool, None).await;
+            let primary = crate::mcp::tests::mock_mcp(&["acme.list_orders"]).await;
+            let blackhole = crate::mcp::tests::slow_mcp(std::time::Duration::from_secs(600)).await;
+            let save = |docs_url: String| {
+                let body = serde_json::json!({
+                    "mcp": {"url": format!("{}/mcp", primary.uri())},
+                    "mcp_servers": [{"id": "docs", "url": docs_url, "tool_prefix": "docs",
+                        "allowed_tools": ["docs.*"], "discovery_credential": "docs-svc"}],
+                });
+                send(
+                    &state,
+                    request(
+                        Method::PUT,
+                        "/admin/api/agents/support",
+                        &cookie,
+                        Some(body),
+                    ),
+                )
+            };
+
+            let started = std::time::Instant::now();
+            let (status, body) = save(format!("{}/mcp", blackhole.uri())).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the save waited on discovery: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(json(&body), serde_json::json!({"ok": true}));
+
+            let (status, body) = save("ftp://docs.acme.test".into()).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert!(body.contains("mcp_servers[docs].url"), "{body}");
+        })
+        .await;
+    }
+
     /// A tenant with no database behind it, for the checks that answer
     /// before any store is touched.
     fn store_less_fixture(git_managed: bool) -> (Arc<EdgeState>, String) {

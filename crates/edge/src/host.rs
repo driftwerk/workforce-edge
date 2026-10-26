@@ -701,6 +701,13 @@ impl AgentHost {
         &self.agent
     }
 
+    /// Stop this host's background work once it is unmounted or replaced.
+    /// Turns still running on it finish; an MCP server they reach that was
+    /// not yet discovered is discovered lazily, as on any first turn.
+    pub(crate) fn retire(&self) {
+        self.mcp.retire();
+    }
+
     /// The agent's session store — for the owner-scoped conversation read API.
     /// The edge's Weaviate store — for the admin lessons viewer.
     pub(crate) fn memory(&self) -> &Arc<dyn MemoryStore> {

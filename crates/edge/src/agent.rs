@@ -670,8 +670,8 @@ pub fn allowlist_admits_on_the_wire(entries: &[String], tool: &str) -> bool {
 /// which no additional server may take.
 pub const PRIMARY_MCP_ID: &str = "default";
 
-/// How long a server that is not required is skipped after its turn start
-/// timed out, when it names no window of its own.
+/// How long a server that is not required is skipped after its startup
+/// discovery or turn start timed out, when it names no window of its own.
 pub const DEFAULT_UNAVAILABLE_SKIP_SECS: u64 = 60;
 
 /// How a server's tool calls authenticate as the customer.
@@ -717,8 +717,9 @@ pub struct McpSettings {
     /// `true` for the primary server, `false` for an additional one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
-    /// How long a server that is not required is skipped after its turn start
-    /// timed out, so a stalled server does not slow every turn. `None` ⇒
+    /// How long a server that is not required is skipped after its startup
+    /// discovery or turn start timed out, so a stalled server does not slow
+    /// every turn. `None` ⇒
     /// [`DEFAULT_UNAVAILABLE_SKIP_SECS`]; `0` ⇒ never skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_skip_secs: Option<u64>,
@@ -860,7 +861,7 @@ impl<'a> McpServerSpec<'a> {
         }
     }
 
-    /// How long this server is skipped after a timed-out turn start.
+    /// How long this server is skipped after a timeout.
     pub fn unavailable_skip(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
             self.connection

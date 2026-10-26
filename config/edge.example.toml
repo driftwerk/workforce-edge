@@ -95,7 +95,9 @@ keycloak_issuer = "https://auth.harbor.example/realms/harbor"
 [agents.embed.mcp]
 # The company MCP server this agent acts against, as the logged-in customer.
 url = "https://mcp.harbor.example"
-# OPTIONAL. A service credential to discover the tool list at startup. Omit it
+# OPTIONAL. A service credential to discover the tool list at startup: before
+# the agent serves when the server is required, in the background otherwise,
+# so a server that is not required never delays boot or an admin save. Omit it
 # and the tools are discovered lazily on the first customer turn using that
 # customer's own token — for MCP servers that accept any valid user token.
 # Per-customer tool calls always carry the customer's own token regardless.
@@ -111,7 +113,8 @@ url = "https://mcp.harbor.example"
 #   turn. Default true here (the primary server) and false on an additional
 #   server, whose outage only removes its tools for that turn.
 # - unavailable_skip_secs: how long a server that is not required sits out
-#   after its turn start timed out. Default 60; 0 never skips.
+#   after its startup discovery or turn start timed out. Default 60; 0 never
+#   skips.
 # auth = "exchanged"
 # audience = "harbor-mcp"
 
