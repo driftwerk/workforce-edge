@@ -257,13 +257,18 @@ pub struct EmbedSettings {
 }
 
 impl EmbedSettings {
-    /// The primary's tools, then each additional server's.
-    fn tool_sets(&self) -> impl Iterator<Item = ToolSet<'_>> {
-        std::iter::once(ToolSet {
+    /// The primary server's tools: `allowed_tools` and `tool_grants`.
+    fn primary_tools(&self) -> ToolSet<'_> {
+        ToolSet {
             allowed_tools: &self.allowed_tools,
             tool_grants: &self.tool_grants,
-        })
-        .chain(self.mcp_servers.iter().map(McpServerSettings::tools))
+        }
+    }
+
+    /// The primary's tools, then each additional server's.
+    fn tool_sets(&self) -> impl Iterator<Item = ToolSet<'_>> {
+        std::iter::once(self.primary_tools())
+            .chain(self.mcp_servers.iter().map(McpServerSettings::tools))
     }
 
     /// The tools this user may be offered: every server's base allowlist plus
@@ -296,13 +301,9 @@ impl EmbedSettings {
 
     /// The primary server first, then the additional ones in declared order.
     pub fn mcp_server_specs(&self) -> Vec<McpServerSpec<'_>> {
-        let primary_tools = ToolSet {
-            allowed_tools: &self.allowed_tools,
-            tool_grants: &self.tool_grants,
-        };
         self.mcp
             .iter()
-            .map(|mcp| McpServerSpec::new(PRIMARY_MCP_ID, mcp, None, primary_tools, true))
+            .map(|mcp| McpServerSpec::new(PRIMARY_MCP_ID, mcp, None, self.primary_tools(), true))
             .chain(self.mcp_servers.iter().map(|s| {
                 McpServerSpec::new(
                     &s.id,
@@ -1296,11 +1297,6 @@ impl EmbedSettings {
         self.allowed_origins.iter().any(|allowed| allowed == origin)
     }
 
-    /// Whether `tool` survives the closed allowlist (see [`allowlist_admits`]).
-    pub fn tool_allowed(&self, tool: &str) -> bool {
-        allowlist_admits(&self.allowed_tools, tool)
-    }
-
     /// Whether a verified token's holder passes the email allowlist. With no
     /// allowlist, everyone from the realm passes. With one, the token must
     /// carry an `email` matching an entry (ASCII case-insensitive) that the
@@ -1533,17 +1529,6 @@ requires = "admin""#,
     }
 
     #[test]
-    fn tool_allowlist_exact_and_glob() {
-        let e = embed(&[], &["harbor.*", "ping"]);
-        assert!(e.tool_allowed("harbor.list_orders"));
-        assert!(e.tool_allowed("harbor"));
-        assert!(e.tool_allowed("ping"));
-        assert!(!e.tool_allowed("harborx"));
-        assert!(!e.tool_allowed("other.tool"));
-        assert!(!e.tool_allowed("pingx"));
-    }
-
-    #[test]
     fn allowlist_admits_on_the_wire_treats_dot_and_underscore_alike() {
         let entries = ["harbor.*".to_string(), "ping.pong".to_string()];
         for tool in [
@@ -1591,7 +1576,7 @@ requires = "admin""#,
     #[test]
     fn empty_allowlist_permits_no_tools() {
         let e = embed(&[], &[]);
-        assert!(!e.tool_allowed("anything"));
+        assert!(!e.any_server_admits("anything"));
     }
 
     #[test]
