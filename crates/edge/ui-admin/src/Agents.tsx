@@ -3,11 +3,17 @@ import { useEffect, useState } from "react";
 import * as api from "./api";
 import {
   concreteTools,
+  emptyServerRow,
+  exposedName,
   GRANT_SOURCES,
   integrationEdit,
   integrationForm,
+  names,
+  toggleName,
   type GrantRow,
   type IntegrationForm,
+  type McpConnectionRow,
+  type McpServerRow,
 } from "./agentForm";
 import { AgentTraining } from "./AgentTraining";
 import { History } from "./History";
@@ -235,6 +241,287 @@ function AgentCard({
 
 type Tab = "persona" | "access" | "integration" | "appearance" | "training";
 
+/** Per-user write tiers: one row per grant, tools as free text. */
+function GrantRows({
+  rows,
+  onChange,
+  readOnly,
+}: {
+  rows: GrantRow[];
+  onChange: (rows: GrantRow[]) => void;
+  readOnly: boolean;
+}) {
+  const patch = (i: number, p: Partial<GrantRow>) => onChange(rows.map((g, j) => (j === i ? { ...g, ...p } : g)));
+  return (
+    <div>
+      {rows.map((g, i) => (
+        <div className="grant-row" key={i}>
+          <select
+            className="select"
+            value={g.source}
+            disabled={readOnly}
+            onChange={(e) => patch(i, { source: e.target.value as api.GrantSource })}
+          >
+            {GRANT_SOURCES.map(([v, label]) => (
+              <option key={v} value={v}>
+                {label}
+              </option>
+            ))}
+          </select>
+          <input value={g.requires} placeholder="items:edit" onChange={(e) => patch(i, { requires: e.target.value })} />
+          <input
+            className="mono-area"
+            value={g.tools}
+            placeholder="tools unlocked, space-separated"
+            onChange={(e) => patch(i, { tools: e.target.value })}
+          />
+          {!readOnly && (
+            <button className="btn-sm ghost" type="button" onClick={() => onChange(rows.filter((_, j) => j !== i))}>
+              Remove
+            </button>
+          )}
+        </div>
+      ))}
+      {!readOnly && (
+        <button
+          className="btn-sm ghost"
+          type="button"
+          onClick={() => onChange([...rows, { source: "backend_permissions", requires: "", tools: "" }])}
+        >
+          + Add grant
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** One MCP server's connection: URL, write-only credential, how it
+ *  authenticates, and how its being unavailable is handled. Rendered as
+ *  label/control pairs inside a `form-grid`. */
+function McpConnectionFields({
+  value,
+  onChange,
+  readOnly,
+  urlLabel,
+  urlHint,
+}: {
+  value: McpConnectionRow;
+  onChange: (value: McpConnectionRow) => void;
+  readOnly: boolean;
+  urlLabel: string;
+  urlHint: string;
+}) {
+  const set = <K extends keyof McpConnectionRow>(k: K, v: McpConnectionRow[K]) => onChange({ ...value, [k]: v });
+  const off = readOnly || !value.url.trim();
+  return (
+    <>
+      <label>
+        {urlLabel}
+        <span className="hint">{urlHint}</span>
+      </label>
+      <input value={value.url} disabled={readOnly} onChange={(e) => set("url", e.target.value)} placeholder="https://mcp.company.com" />
+      <label>
+        Discovery credential
+        <span className="hint">service account for listing tools at start; write-only</span>
+      </label>
+      <div>
+        <div className="op-add" style={{ margin: 0 }}>
+          <span className={`pill ${value.has_credential ? "pill-domain" : "pill-neutral"}`}>
+            {value.has_credential ? "set" : "not set"}
+          </span>
+          <input
+            type="password"
+            autoComplete="off"
+            value={value.credential}
+            disabled={off || value.clear_credential}
+            placeholder={value.has_credential ? "Replace on save" : "Set on save"}
+            onChange={(e) => set("credential", e.target.value)}
+          />
+        </div>
+        {value.has_credential && (
+          <label className="check" style={{ marginTop: 8 }}>
+            <input
+              type="checkbox"
+              checked={value.clear_credential}
+              disabled={readOnly}
+              onChange={(e) => set("clear_credential", e.target.checked)}
+            />
+            Clear the stored credential on save
+          </label>
+        )}
+      </div>
+      <label>
+        Customer token
+        <span className="hint">exchanged for this server's audience, or always the customer's own</span>
+      </label>
+      <div className="op-add" style={{ margin: 0 }}>
+        <select
+          className="select"
+          value={value.auth}
+          disabled={off}
+          onChange={(e) => set("auth", e.target.value as api.McpAuth)}
+        >
+          <option value="exchanged">Exchanged</option>
+          <option value="forwarded">Forwarded</option>
+        </select>
+        <input
+          value={value.audience}
+          disabled={off || value.auth !== "exchanged"}
+          placeholder="audience (blank = the install's)"
+          onChange={(e) => set("audience", e.target.value)}
+        />
+      </div>
+      <label>
+        When unavailable
+        <span className="hint">required: the turn fails; otherwise only this server's tools are missing</span>
+      </label>
+      <div className="op-add" style={{ margin: 0 }}>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={value.required}
+            disabled={off}
+            onChange={(e) => set("required", e.target.checked)}
+          />
+          Required
+        </label>
+        <input
+          type="number"
+          min={0}
+          value={value.unavailable_skip_secs}
+          disabled={off || value.required}
+          title="seconds a timed-out server sits out; 0 never skips"
+          onChange={(e) => set("unavailable_skip_secs", e.target.value)}
+        />
+      </div>
+    </>
+  );
+}
+
+/** The additional MCP servers, one bordered row each, with a Discover button
+ *  that lists the server's tools under its prefix for picking. */
+function McpServerList({
+  rows,
+  onChange,
+  readOnly,
+}: {
+  rows: McpServerRow[];
+  onChange: (rows: McpServerRow[]) => void;
+  readOnly: boolean;
+}) {
+  const [surveys, setSurveys] = useState<Record<number, api.McpSurvey | string>>({});
+  const patch = (i: number, p: Partial<McpServerRow>) => onChange(rows.map((r, j) => (j === i ? { ...r, ...p } : r)));
+  const discover = async (i: number) => {
+    const row = rows[i];
+    try {
+      const survey = await api.discoverMcp({
+        url: row.url.trim(),
+        ...(row.credential.trim() ? { discovery_credential: row.credential.trim() } : {}),
+      });
+      setSurveys((s) => ({ ...s, [i]: survey }));
+    } catch (err) {
+      setSurveys((s) => ({ ...s, [i]: err instanceof Error ? err.message : String(err) }));
+    }
+  };
+  return (
+    <div>
+      {rows.map((row, i) => {
+        const survey = surveys[i];
+        return (
+          <div className="server-row" key={i}>
+            <div className="form-grid">
+              <label>
+                Id<span className="hint">names the server in logs and errors</span>
+              </label>
+              <input value={row.id} disabled={readOnly} placeholder="docs" onChange={(e) => patch(i, { id: e.target.value })} />
+              <McpConnectionFields
+                value={row}
+                onChange={(c) => patch(i, c)}
+                readOnly={readOnly}
+                urlLabel="MCP URL"
+                urlHint="where this server's tools live"
+              />
+              <label>
+                Tool prefix<span className="hint">optional; tools are named prefix.tool</span>
+              </label>
+              <input
+                value={row.tool_prefix}
+                disabled={readOnly}
+                placeholder="docs"
+                onChange={(e) => patch(i, { tool_prefix: e.target.value })}
+              />
+              <label>
+                Allowed tools<span className="hint">in the names the agent sees; prefix.* allows them all</span>
+              </label>
+              <div>
+                <textarea
+                  className="mono-area"
+                  rows={2}
+                  value={row.allowed_tools}
+                  disabled={readOnly}
+                  onChange={(e) => patch(i, { allowed_tools: e.target.value })}
+                />
+                {!readOnly && (
+                  <button
+                    className="btn-sm ghost"
+                    type="button"
+                    disabled={!row.url.trim()}
+                    onClick={() => void discover(i)}
+                  >
+                    Discover tools
+                  </button>
+                )}
+                {typeof survey === "string" && <p className="err">{survey}</p>}
+                {survey && typeof survey !== "string" && (
+                  <div className="tool-list" style={{ marginTop: 8 }}>
+                    {survey.tools.map((t) => {
+                      const name = exposedName(row.tool_prefix, t.name);
+                      return (
+                        <label key={t.name} className="tool-row">
+                          <input
+                            type="checkbox"
+                            checked={names(row.allowed_tools).includes(name)}
+                            onChange={(e) => patch(i, { allowed_tools: toggleName(row.allowed_tools, name, e.target.checked) })}
+                          />
+                          <span>
+                            <span className="tool-name">{name}</span>
+                            {t.description && <div className="tool-desc">{t.description}</div>}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              <label>
+                Tool grants<span className="hint">write tiers on this server, unlocked per user</span>
+              </label>
+              <GrantRows rows={row.tool_grants} onChange={(g) => patch(i, { tool_grants: g })} readOnly={readOnly} />
+            </div>
+            {!readOnly && (
+              <button
+                className="btn-sm ghost"
+                type="button"
+                onClick={() => {
+                  setSurveys({});
+                  onChange(rows.filter((_, j) => j !== i));
+                }}
+              >
+                Remove server
+              </button>
+            )}
+          </div>
+        );
+      })}
+      {!readOnly && (
+        <button className="btn-sm ghost" type="button" onClick={() => onChange([...rows, emptyServerRow()])}>
+          + Add server
+        </button>
+      )}
+    </div>
+  );
+}
+
 function AgentEditor({
   mode,
   agent,
@@ -278,10 +565,7 @@ function AgentEditor({
   const [integ, setInteg] = useState<IntegrationForm>(() => integrationForm(agent));
   const setInt = <K extends keyof IntegrationForm>(k: K, v: IntegrationForm[K]) =>
     setInteg((p) => ({ ...p, [k]: v }));
-  const setGrant = (i: number, patch: Partial<GrantRow>) =>
-    setInt("tool_grants", integ.tool_grants.map((g, j) => (j === i ? { ...g, ...patch } : g)));
-  const hasCredential = agent?.has_discovery_credential ?? false;
-  const pickable = concreteTools(lines(tools), integ.tool_grants);
+  const pickable = concreteTools(lines(tools), integ.tool_grants, integ.mcp_servers);
   const [b, setB] = useState<api.Branding>({ ...(agent?.branding ?? {}) });
   // Git-managed installs: everything but Appearance is read-only (edit in git).
   const readOnly = api.isGitManaged() && !isNew;
@@ -637,44 +921,22 @@ function AgentEditor({
 
       {tab === "integration" && (
         <div className="form-grid">
-          <label>
-            Company MCP URL<span className="hint">the server the agent's tools live on; blank = pure chat</span>
-          </label>
-          <input
-            value={integ.mcp_url}
-            onChange={(e) => setInt("mcp_url", e.target.value)}
-            placeholder="https://mcp.company.com"
+          <McpConnectionFields
+            value={integ.mcp}
+            onChange={(mcp) => setInt("mcp", mcp)}
+            readOnly={readOnly}
+            urlLabel="Company MCP URL"
+            urlHint="the primary server the agent's tools live on; blank = pure chat"
           />
           <label>
-            Discovery credential
-            <span className="hint">service account for listing tools at start; write-only</span>
+            Additional MCP servers
+            <span className="hint">more servers alongside the primary, each with its own allowlist</span>
           </label>
-          <div>
-            <div className="op-add" style={{ margin: 0 }}>
-              <span className={`pill ${hasCredential ? "pill-domain" : "pill-neutral"}`}>
-                {hasCredential ? "set" : "not set"}
-              </span>
-              <input
-                type="password"
-                autoComplete="off"
-                value={integ.credential}
-                disabled={readOnly || !integ.mcp_url.trim() || integ.clear_credential}
-                placeholder={hasCredential ? "Replace on save" : "Set on save"}
-                onChange={(e) => setInt("credential", e.target.value)}
-              />
-            </div>
-            {hasCredential && (
-              <label className="check" style={{ marginTop: 8 }}>
-                <input
-                  type="checkbox"
-                  checked={integ.clear_credential}
-                  disabled={readOnly}
-                  onChange={(e) => setInt("clear_credential", e.target.checked)}
-                />
-                Clear the stored credential on save
-              </label>
-            )}
-          </div>
+          <McpServerList
+            rows={integ.mcp_servers}
+            onChange={(rows) => setInt("mcp_servers", rows)}
+            readOnly={readOnly || !integ.mcp.url.trim()}
+          />
           <label>
             Permissions URL
             <span className="hint">resolves backend permission grants; {"{user}"} becomes the signed-in user</span>
@@ -698,58 +960,11 @@ function AgentEditor({
             Tool grants
             <span className="hint">write tiers unlocked per user, on top of the allowed tools</span>
           </label>
-          <div>
-            {integ.tool_grants.map((g, i) => (
-              <div className="grant-row" key={i}>
-                <select
-                  className="select"
-                  value={g.source}
-                  disabled={readOnly}
-                  onChange={(e) => setGrant(i, { source: e.target.value as api.GrantSource })}
-                >
-                  {GRANT_SOURCES.map(([v, label]) => (
-                    <option key={v} value={v}>
-                      {label}
-                    </option>
-                  ))}
-                </select>
-                <input
-                  value={g.requires}
-                  placeholder="items:edit"
-                  onChange={(e) => setGrant(i, { requires: e.target.value })}
-                />
-                <input
-                  className="mono-area"
-                  value={g.tools}
-                  placeholder="tools unlocked, space-separated"
-                  onChange={(e) => setGrant(i, { tools: e.target.value })}
-                />
-                {!readOnly && (
-                  <button
-                    className="btn-sm ghost"
-                    type="button"
-                    onClick={() => setInt("tool_grants", integ.tool_grants.filter((_, j) => j !== i))}
-                  >
-                    Remove
-                  </button>
-                )}
-              </div>
-            ))}
-            {!readOnly && (
-              <button
-                className="btn-sm ghost"
-                type="button"
-                onClick={() =>
-                  setInt("tool_grants", [
-                    ...integ.tool_grants,
-                    { source: "backend_permissions", requires: "", tools: "" },
-                  ])
-                }
-              >
-                + Add grant
-              </button>
-            )}
-          </div>
+          <GrantRows
+            rows={integ.tool_grants}
+            onChange={(rows) => setInt("tool_grants", rows)}
+            readOnly={readOnly}
+          />
           <label>Write policy</label>
           <label className="check">
             <input

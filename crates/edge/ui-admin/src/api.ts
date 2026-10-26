@@ -395,11 +395,45 @@ export interface EmbedPolicy {
   confirm_writes: boolean | null;
 }
 
-/** The MCP block as PUT/POST carry it. The credential is write-only: absent
- *  or null keeps what is stored, "" clears it, anything else replaces it. */
+/** How a server's tool calls authenticate as the customer: the turn's
+ *  exchanged token for the server's audience, or always the customer's own. */
+export type McpAuth = "exchanged" | "forwarded";
+
+/** An MCP server as the agent list shows it, with its effective defaults.
+ *  The credential itself never comes back. */
+export interface McpServer {
+  id: string;
+  url: string;
+  auth: McpAuth;
+  audience: string | null;
+  required: boolean;
+  unavailable_skip_secs: number;
+  has_discovery_credential: boolean;
+  tool_prefix: string | null;
+  allowed_tools: string[];
+  tool_grants: ToolGrant[];
+}
+
+/** An MCP server's connection as PUT/POST carry it. The credential is
+ *  write-only: absent or null keeps what is stored, "" clears it, anything
+ *  else replaces it. Any other field left out keeps its stored value; null
+ *  resets it to the default. */
 export interface McpEdit {
   url: string;
   discovery_credential?: string | null;
+  auth?: McpAuth;
+  audience?: string | null;
+  required?: boolean | null;
+  unavailable_skip_secs?: number | null;
+}
+
+/** An additional MCP server as PUT/POST carry it: its connection plus its
+ *  own allowlist and write tiers, in the names the agent sees. */
+export interface McpServerEdit extends McpEdit {
+  id: string;
+  tool_prefix: string | null;
+  allowed_tools: string[];
+  tool_grants: ToolGrant[];
 }
 
 export interface Agent {
@@ -432,6 +466,10 @@ export interface Agent {
   /** Whether a discovery credential is stored; the credential itself never
    *  comes back. */
   has_discovery_credential: boolean;
+  /** The primary server's connection, or null for a pure-chat agent. */
+  mcp_settings: McpServer | null;
+  /** The servers used alongside the primary, in declared order. */
+  mcp_servers: McpServer[];
   permissions: PermissionsConfig | null;
   tool_grants: ToolGrant[];
   policy: EmbedPolicy | null;
@@ -458,6 +496,7 @@ export interface AgentCreate {
   keycloak_audience?: string | null;
   allowed_tools: string[];
   mcp?: McpEdit | null;
+  mcp_servers?: McpServerEdit[];
   branding: Branding;
   data_tables?: boolean;
   charts?: boolean;
@@ -499,6 +538,7 @@ export async function deleteAgent(id: string): Promise<void> {
 // The fields an operator may edit. A `null` model/auto_playbook clears to the
 // install default; absent = unchanged. `mcp: null` makes a pure-chat agent;
 // its credential travels write-only inside `mcp` (see `McpEdit`).
+// `mcp_servers` replaces the whole list; absent leaves it as it is.
 export interface AgentEdit {
   display_name?: string;
   identity?: IdentityFiles;
@@ -524,6 +564,7 @@ export interface AgentEdit {
   upload_max_mb?: number | null;
   drawing?: boolean;
   mcp?: McpEdit | null;
+  mcp_servers?: McpServerEdit[];
   permissions?: PermissionsConfig | null;
   tool_grants?: ToolGrant[];
   policy?: EmbedPolicy | null;
