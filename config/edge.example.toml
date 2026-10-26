@@ -56,6 +56,14 @@ provider = "bedrock"
 # ("powerful" / "standard" / "cheap") or a concrete model id.
 default_model = "standard"
 
+# OPTIONAL. Prometheus metrics at GET /metrics (the edge_mcp_* series; see the
+# README). Off unless enabled. When on, a scraper must send
+# `Authorization: Bearer <bearer_token>`; the token must be at least 32
+# characters, and the endpoint is never served without one.
+# [metrics]
+# enabled = true
+# bearer_token = "${EDGE_METRICS_TOKEN}"
+
 # One or more customer-facing agents. Each is embeddable in the company webapp
 # whose origins it names.
 [[agents]]
