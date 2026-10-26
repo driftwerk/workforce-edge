@@ -428,7 +428,8 @@ export interface McpEdit {
 }
 
 /** An additional MCP server as PUT/POST carry it: its connection plus its
- *  own allowlist and write tiers, in the names the agent sees. */
+ *  own allowlist and write tiers, in the names the agent sees, under the same
+ *  rule. A new id starts from the defaults and must name a url. */
 export interface McpServerEdit extends McpEdit {
   id: string;
   tool_prefix: string | null;
