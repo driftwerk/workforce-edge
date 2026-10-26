@@ -509,8 +509,23 @@ impl EmbedPolicy {
     }
 }
 
+/// Whether a closed tool allowlist admits `tool`: an entry naming it exactly,
+/// or a `prefix.*` glob matching `prefix` itself or anything in its dotted
+/// namespace. The one matcher every allowlist in the edge goes through.
+pub fn allowlist_admits(entries: &[String], tool: &str) -> bool {
+    entries.iter().any(|entry| match entry.strip_suffix(".*") {
+        Some(prefix) => {
+            tool == prefix
+                || tool
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        }
+        None => tool == entry,
+    })
+}
+
 /// The one company MCP server an edge agent connects to.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct McpSettings {
     /// Base URL of the company MCP server.
     pub url: String,
@@ -519,6 +534,26 @@ pub struct McpSettings {
     /// token instead.
     #[serde(default)]
     pub discovery_credential: Option<String>,
+}
+
+impl McpSettings {
+    /// Whether a non-empty discovery credential is configured — what logs and
+    /// the admin are told in place of the credential itself.
+    pub fn has_discovery_credential(&self) -> bool {
+        self.discovery_credential
+            .as_deref()
+            .is_some_and(|c| !c.is_empty())
+    }
+}
+
+// Manual Debug so the discovery credential never lands in a debug log.
+impl std::fmt::Debug for McpSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpSettings")
+            .field("url", &self.url)
+            .field("has_discovery_credential", &self.has_discovery_credential())
+            .finish()
+    }
 }
 
 /// Per-install widget theme. Every field is optional; the loader applies safe
@@ -804,15 +839,9 @@ impl EmbedSettings {
         self.allowed_origins.iter().any(|allowed| allowed == origin)
     }
 
-    /// Whether `tool` survives the closed allowlist: an exact match, or a
-    /// `prefix.*` glob matching the tool's dotted namespace.
+    /// Whether `tool` survives the closed allowlist (see [`allowlist_admits`]).
     pub fn tool_allowed(&self, tool: &str) -> bool {
-        self.allowed_tools
-            .iter()
-            .any(|entry| match entry.strip_suffix(".*") {
-                Some(prefix) => tool == prefix || tool.starts_with(&format!("{prefix}.")),
-                None => tool == entry,
-            })
+        allowlist_admits(&self.allowed_tools, tool)
     }
 
     /// Whether a verified token's holder passes the email allowlist. With no
@@ -1074,6 +1103,34 @@ requires = "admin""#,
         assert!(!e.tool_allowed("harborx"));
         assert!(!e.tool_allowed("other.tool"));
         assert!(!e.tool_allowed("pingx"));
+    }
+
+    #[test]
+    fn allowlist_admits_exact_and_glob() {
+        let entries = ["harbor.*".to_string(), "ping".to_string()];
+        assert!(allowlist_admits(&entries, "harbor.list_orders"));
+        assert!(allowlist_admits(&entries, "harbor.reports.daily"));
+        assert!(allowlist_admits(&entries, "harbor"));
+        assert!(allowlist_admits(&entries, "ping"));
+        assert!(!allowlist_admits(&entries, "harborx"));
+        assert!(!allowlist_admits(&entries, "harbor_list_orders"));
+        assert!(!allowlist_admits(&entries, "other.tool"));
+        assert!(!allowlist_admits(&entries, "pingx"));
+        assert!(!allowlist_admits(&[], "ping"));
+    }
+
+    #[test]
+    fn mcp_settings_debug_never_prints_the_credential() {
+        let mcp = McpSettings {
+            url: "https://mcp.example.test".into(),
+            discovery_credential: Some("svc-secret-7".into()),
+        };
+        let printed = format!("{mcp:?}");
+        assert!(!printed.contains("svc-secret-7"), "{printed}");
+        assert!(
+            printed.contains("has_discovery_credential: true"),
+            "{printed}"
+        );
     }
 
     #[test]
