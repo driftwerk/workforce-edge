@@ -37,6 +37,7 @@ use workforce_mcp_client::{
 
 use crate::agent::{allowlist_admits, EmbedSettings, McpAuth, McpServerSpec};
 use crate::host::BUILT_IN_TOOLS;
+use crate::metrics::{self, CacheResult, CallOutcome, DiscoveryPhase};
 use crate::outbound::{self, OutboundPolicy};
 use crate::token_exchange::TokenExchanger;
 
@@ -189,7 +190,9 @@ impl AuthProvider for SharedBearer {
 /// single customer's token.
 #[derive(Clone)]
 pub struct McpToolset {
-    /// The server's id, as logs and messages name it.
+    /// The agent this server serves, for its metrics.
+    agent: Arc<str>,
+    /// The server's id, as logs, messages and metrics name it.
     id: Arc<str>,
     endpoint: Url,
     /// How `endpoint` is reached. Under `Public` the shared `http` is unused:
@@ -269,6 +272,7 @@ impl McpToolset {
     /// `policy` here, so a disallowed server fails the agent at build rather
     /// than on a customer's first turn. Nothing is dialled.
     fn prepare(
+        agent: &str,
         spec: &McpServerSpec<'_>,
         policy: OutboundPolicy,
         install_audience: Option<&str>,
@@ -279,6 +283,7 @@ impl McpToolset {
         outbound::check_url(policy, &endpoint)
             .wrap_err_with(|| format!("refusing MCP url {url:?} for server {}", spec.id))?;
         Ok(Self {
+            agent: agent.into(),
             id: spec.id.into(),
             endpoint,
             policy,
@@ -312,7 +317,7 @@ impl McpToolset {
         };
         let client = self.client_for(Arc::new(StaticBearer::new(credential)))?;
         let tools = self
-            .discover_on(&client)
+            .timed_discovery(DiscoveryPhase::Startup, self.discover_on(&client))
             .await
             .wrap_err_with(|| format!("MCP tool discovery at startup (server {})", self.id))?;
         *self.defs.write().await = Some(CachedDefs::now(Arc::new(tools)));
@@ -383,6 +388,19 @@ impl McpToolset {
             .collect())
     }
 
+    /// Run one discovery, counting it and its duration by how it ended.
+    async fn timed_discovery<T>(
+        &self,
+        phase: DiscoveryPhase,
+        discovery: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let started = Instant::now();
+        let result = discovery.await;
+        let outcome = result.as_ref().map_or_else(outcome_of, |_| "ok");
+        metrics::discovery(&self.agent, &self.id, phase, outcome, started.elapsed());
+        result
+    }
+
     /// The name the model sees for the server's tool `raw`.
     fn exposed_name<'a>(&self, raw: &'a str) -> Cow<'a, str> {
         match &self.tool_prefix {
@@ -443,6 +461,7 @@ impl McpToolset {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) =
             Instant::now().checked_add(self.unavailable_skip);
+        metrics::skip_window_entered(&self.agent, &self.id);
     }
 
     /// Backdate the cached defs past the TTL so the next turn re-lists.
@@ -488,6 +507,7 @@ impl McpToolset {
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
+            agent: "test".into(),
             id: crate::agent::PRIMARY_MCP_ID.into(),
             endpoint: Url::parse("http://unused.invalid").expect("static url"),
             policy: OutboundPolicy::Private,
@@ -520,6 +540,7 @@ impl McpToolset {
         let cached = self.defs.read().await.clone();
         let tools = match cached {
             Some(cached) if cached.at.elapsed() < MCP_DEFS_TTL => {
+                metrics::tools_cache(&self.agent, &self.id, CacheResult::Hit);
                 deadline("initialize", self.handshake_timeout, client.initialize()).await?;
                 cached.tools
             }
@@ -527,8 +548,12 @@ impl McpToolset {
             // changes land without a restart; on failure keep serving the stale
             // list — never degrade a working toolset over a refresh.
             Some(cached) => {
+                metrics::tools_cache(&self.agent, &self.id, CacheResult::Stale);
                 deadline("initialize", self.handshake_timeout, client.initialize()).await?;
-                match self.list_allowlisted(&client).await {
+                match self
+                    .timed_discovery(DiscoveryPhase::Refresh, self.list_allowlisted(&client))
+                    .await
+                {
                     Ok(fresh) => {
                         let fresh = Arc::new(fresh);
                         *self.defs.write().await = Some(CachedDefs::now(Arc::clone(&fresh)));
@@ -550,7 +575,11 @@ impl McpToolset {
                 }
             }
             None => {
-                let fetched = Arc::new(self.discover_on(&client).await?);
+                metrics::tools_cache(&self.agent, &self.id, CacheResult::Miss);
+                let fetched = Arc::new(
+                    self.timed_discovery(DiscoveryPhase::Lazy, self.discover_on(&client))
+                        .await?,
+                );
                 *self.defs.write().await = Some(CachedDefs::now(Arc::clone(&fetched)));
                 fetched
             }
@@ -560,6 +589,7 @@ impl McpToolset {
             .map(|tool| {
                 Arc::new(EdgeMcpTool {
                     client: Arc::clone(&client),
+                    agent: Arc::clone(&self.agent),
                     server: Arc::clone(&self.id),
                     name: tool.name.clone(),
                     def: tool.def.clone(),
@@ -599,7 +629,10 @@ impl TurnAuth {
         let minted = join_all(distinct.into_iter().map(|audience| {
             let subject = &subject;
             async move {
+                let started = Instant::now();
                 let token = exchanger.exchange(subject, audience.as_deref()).await;
+                let outcome = if token.is_ok() { "ok" } else { "failed" };
+                metrics::token_exchange(agent, audience.as_deref(), outcome, started.elapsed());
                 (audience, token)
             }
         }))
@@ -664,7 +697,10 @@ impl McpCatalogue {
         policy: OutboundPolicy,
         exchanger: Option<Arc<TokenExchanger>>,
     ) -> Result<Self> {
-        embed.check_mcp_servers().map_err(|e| eyre!(e))?;
+        embed.check_mcp_servers().map_err(|e| {
+            metrics::config_refused(e.reason);
+            eyre::Report::new(e)
+        })?;
         let specs = embed.mcp_server_specs();
         if exchanger.is_none() {
             specs
@@ -681,7 +717,7 @@ impl McpCatalogue {
         let install_audience = exchanger.as_deref().and_then(TokenExchanger::audience);
         let servers = specs
             .iter()
-            .map(|spec| McpToolset::prepare(spec, policy, install_audience))
+            .map(|spec| McpToolset::prepare(agent, spec, policy, install_audience))
             .collect::<Result<Vec<_>>>()?;
         let discovered = join_all(servers.iter().map(McpToolset::discover_at_startup)).await;
         for (server, outcome) in servers.iter().zip(discovered) {
@@ -725,6 +761,7 @@ impl McpCatalogue {
         let (attempted, skipped): (Vec<&McpToolset>, Vec<&McpToolset>) =
             self.servers.iter().partition(|s| !s.in_skip_window());
         skipped.iter().for_each(|s| {
+            metrics::server_skipped(&self.agent, &s.id);
             tracing::debug!(
                 agent = %self.agent,
                 server = %s.id,
@@ -901,7 +938,8 @@ pub async fn survey(
 /// carries. Deliberately minimal — no metrics, no multi-workspace gating.
 struct EdgeMcpTool {
     client: Arc<McpClient>,
-    /// The serving server's id, for logs.
+    /// The agent and serving server, for logs and metrics.
+    agent: Arc<str>,
     server: Arc<str>,
     /// The name the model sees; `def.name` is the server's own.
     name: String,
@@ -917,6 +955,24 @@ impl EdgeMcpTool {
             .client
             .tools_call(&self.def.name, input, CancellationToken::new());
         tokio::time::timeout(MCP_CALL_TIMEOUT, call).await
+    }
+}
+
+/// How a call's result counts: a tool-level failure is the server's answer,
+/// anything that kept an answer from arriving is the transport's.
+fn call_outcome(
+    result: &Result<std::result::Result<serde_json::Value, McpError>, tokio::time::error::Elapsed>,
+) -> CallOutcome {
+    match result {
+        Ok(Ok(output))
+            if output.get("isError").and_then(serde_json::Value::as_bool) == Some(true) =>
+        {
+            CallOutcome::ToolError
+        }
+        Ok(Ok(_)) => CallOutcome::Ok,
+        Ok(Err(McpError::ServerError { .. })) => CallOutcome::ToolError,
+        Ok(Err(_)) => CallOutcome::TransportError,
+        Err(_) => CallOutcome::Timeout,
     }
 }
 
@@ -947,6 +1003,13 @@ impl Tool for EdgeMcpTool {
             tracing::warn!(server = %self.server, tool = %self.name, "edge MCP tool call auth-expired; retrying once with the live token");
             result = self.timed_call(input).await;
         }
+        metrics::tool_call(
+            &self.agent,
+            &self.server,
+            &self.name,
+            call_outcome(&result),
+            started.elapsed(),
+        );
         match result {
             Ok(Ok(output)) => Ok(ToolResult::success(output, elapsed())),
             // The message stays opaque, but the typed refusal signal survives —
@@ -1049,7 +1112,10 @@ pub(crate) mod tests {
     fn with_timeout(catalogue: &McpCatalogue, server: usize, limit: Duration) -> McpCatalogue {
         let mut servers = catalogue.servers().to_vec();
         servers[server] = servers[server].clone().with_handshake_timeout(limit);
-        McpCatalogue::of(servers)
+        McpCatalogue {
+            servers,
+            ..catalogue.clone()
+        }
     }
 
     #[test]
@@ -1934,6 +2000,175 @@ pub(crate) mod tests {
             .unwrap();
         assert!(registry.has("docs.search") && registry.has("docs.edit_page"));
         assert!(!registry.has("docs.delete_page"));
+    }
+
+    #[tokio::test]
+    async fn a_calls_outcome_tells_the_tools_answer_from_the_transports() {
+        let ok: serde_json::Value = serde_json::json!({"content": []});
+        let failed = serde_json::json!({"isError": true, "content": []});
+        let timed_out =
+            tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>())
+                .await
+                .unwrap_err();
+        let server_error = McpError::ServerError {
+            code: -32000,
+            message: "no such order".into(),
+            data: None,
+        };
+        assert_eq!(call_outcome(&Ok(Ok(ok))), CallOutcome::Ok);
+        assert_eq!(call_outcome(&Ok(Ok(failed))), CallOutcome::ToolError);
+        assert_eq!(call_outcome(&Ok(Err(server_error))), CallOutcome::ToolError);
+        assert_eq!(
+            call_outcome(&Ok(Err(McpError::Transport("refused".into())))),
+            CallOutcome::TransportError
+        );
+        assert_eq!(call_outcome(&Err(timed_out)), CallOutcome::Timeout);
+    }
+
+    /// One agent's turns, recorded: startup and lazy discovery, cache hits
+    /// and misses, a timed-out server entering and then sitting out its
+    /// window, an exchange per audience with its outcome, a tool call, and a
+    /// refused config — each under its server's (or audience's) label and
+    /// nothing unbounded.
+    #[test]
+    fn mcp_metrics_are_emitted_per_server_with_bounded_labels() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let keycloak = mock_exchange(&["docs-mcp"]).await;
+                let primary = mock_mcp(&["harbor.list_orders"]).await;
+                let docs = mock_mcp(&["search"]).await;
+                let wiki = slow_mcp(Duration::from_millis(500)).await;
+                let mut settings = embed(&primary.uri(), Some("svc-cred"));
+                settings.allowed_tools = vec!["harbor.*".into()];
+                let mut docs_server = extra("docs", &docs.uri(), Some("docs"), &["docs.*"]);
+                docs_server.connection.audience = Some("docs-mcp".into());
+                settings.mcp_servers = vec![
+                    docs_server,
+                    extra("wiki", &wiki.uri(), Some("wiki"), &["wiki.*"]),
+                ];
+                let built = McpCatalogue::build(
+                    AGENT,
+                    &settings,
+                    OutboundPolicy::Private,
+                    Some(exchanger(&keycloak, Some("harbor-mcp"))),
+                )
+                .await
+                .unwrap();
+                let catalogue = with_timeout(&built, 2, Duration::from_millis(50));
+                let first = catalogue.registry_for(&customer()).await.unwrap();
+                first
+                    .get("harbor.list_orders")
+                    .unwrap()
+                    .execute(serde_json::json!({}))
+                    .await
+                    .unwrap();
+                catalogue.registry_for(&customer()).await.unwrap();
+
+                let mut colliding = embed("http://mcp.local", None);
+                colliding.allowed_tools = vec!["harbor.*".into()];
+                colliding.mcp_servers = vec![extra("crm", "http://crm.local", None, &["harbor_x"])];
+                assert!(build(&colliding).await.is_err());
+            })
+        });
+        let recorded = crate::metrics::tests::recorded(&snapshotter);
+        crate::metrics::tests::assert_bounded(&recorded);
+        let count = |key: &str| recorded.get(key).copied().unwrap_or(0);
+        let agent = "agent=northwind-help";
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_discovery_total{{{agent},outcome=ok,phase=startup,server=default}}"
+            )),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_discovery_total{{{agent},outcome=ok,phase=lazy,server=docs}}"
+            )),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_discovery_total{{{agent},outcome=timed_out,phase=lazy,server=wiki}}"
+            )),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_discovery_duration_seconds{{{agent},phase=lazy,server=wiki}}"
+            )),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_tools_cache_total{{{agent},result=hit,server=default}}"
+            )),
+            2
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_tools_cache_total{{{agent},result=miss,server=docs}}"
+            )),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_tools_cache_total{{{agent},result=hit,server=docs}}"
+            )),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_skip_window_entered_total{{{agent},server=wiki}}"
+            )),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_server_skipped_total{{{agent},server=wiki}}"
+            )),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_token_exchanges_total{{{agent},audience=harbor-mcp,outcome=ok}}"
+            )),
+            2,
+            "the primary's audience, once per turn"
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_token_exchanges_total{{{agent},audience=docs-mcp,outcome=failed}}"
+            )),
+            2
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_token_exchange_duration_seconds{{{agent},audience=docs-mcp}}"
+            )),
+            2
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_tool_calls_total{{{agent},outcome=ok,server=default,tool=harbor.list_orders}}"
+            )),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_tool_call_duration_seconds{{{agent},server=default,tool=harbor.list_orders}}"
+            )),
+            1
+        );
+        assert_eq!(
+            count("edge_mcp_config_refusals_total{reason=name_collision}"),
+            1
+        );
     }
 
     #[test]

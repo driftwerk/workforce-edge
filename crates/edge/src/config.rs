@@ -77,6 +77,11 @@ pub struct EdgeConfig {
     /// Meaningful with `server.multi_tenant`; allowed without it.
     #[serde(default)]
     pub platform: Option<crate::platform::PlatformConfig>,
+    /// The Prometheus `/metrics` endpoint. Absent or disabled ⇒ the route is
+    /// not mounted and no recorder is installed; enabled ⇒ served only to a
+    /// scraper presenting its bearer token.
+    #[serde(default)]
+    pub metrics: Option<crate::metrics::MetricsConfig>,
 }
 
 /// `[git_config]` — the GitHub repo that holds agent definitions, playbooks, and

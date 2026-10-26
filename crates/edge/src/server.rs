@@ -80,6 +80,9 @@ pub struct EdgeState {
     /// The platform surface, when `[platform]` is set; `None` leaves every
     /// `/platform` route 404.
     platform: Option<Arc<crate::platform::PlatformState>>,
+    /// The `/metrics` route, when `[metrics]` is enabled; `None` leaves it
+    /// unmounted.
+    metrics: Option<Arc<crate::metrics::MetricsEndpoint>>,
 }
 
 /// Requests per minute one address may send to hosts that name no served
@@ -116,6 +119,8 @@ impl EdgeState {
             .transpose()
             .wrap_err("building the platform surface")?
             .map(Arc::new);
+        let metrics =
+            crate::metrics::MetricsEndpoint::from_config(config.metrics.as_ref())?.map(Arc::new);
         if platform.is_some() && !config.server.multi_tenant {
             tracing::warn!(
                 "[platform] is set without server.multi_tenant: the platform API can manage the \
@@ -138,6 +143,7 @@ impl EdgeState {
             unresolved_limiter: RateLimiter::new(UNRESOLVED_PER_MIN, Duration::from_secs(60)),
             shutdown: CancellationToken::new(),
             platform,
+            metrics,
         };
         match &state.mode {
             TenantMode::Single(id) => {
@@ -616,6 +622,9 @@ impl EdgeState {
             .transpose()
             .expect("a valid test [platform]")
             .map(Arc::new);
+        let metrics = crate::metrics::MetricsEndpoint::from_config(config.metrics.as_ref())
+            .expect("a valid test [metrics]")
+            .map(Arc::new);
         let state = Self {
             infra,
             tenants: std::sync::RwLock::new(HashMap::new()),
@@ -628,6 +637,7 @@ impl EdgeState {
             unresolved_limiter: RateLimiter::new(UNRESOLVED_PER_MIN, Duration::from_secs(60)),
             shutdown: CancellationToken::new(),
             platform,
+            metrics,
         };
         for (runtime, hostnames) in tenants {
             for host in hostnames {
@@ -3910,7 +3920,10 @@ fn validate_embed(embed: &EmbedSettings, checks: EmbedChecks) -> std::result::Re
         embed.mcp_servers.iter().try_for_each(|s| {
             check_mcp_url(&format!("mcp_servers[{}].url", s.id), &s.connection.url)
         })?;
-        embed.check_mcp_servers()?;
+        embed.check_mcp_servers().map_err(|e| {
+            crate::metrics::config_refused(e.reason);
+            e.message
+        })?;
     }
     if checks.permissions {
         if let Some(p) = &embed.permissions {
@@ -6124,9 +6137,14 @@ pub fn router(state: Arc<EdgeState>) -> Router {
             Arc::clone(&state),
             admin_guard,
         ));
+    let metrics = state
+        .metrics
+        .clone()
+        .map_or_else(Router::new, crate::metrics::router);
     Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
+        .merge(metrics)
         .route("/admin/api/login", axum::routing::post(admin_login))
         .route(
             "/admin/api/login/oidc",
@@ -7156,6 +7174,56 @@ mod tenant_tests {
             .await
             .unwrap();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// `/metrics` is mounted only when `[metrics]` is enabled, and then
+    /// answers only a scraper presenting the configured bearer token.
+    #[tokio::test]
+    async fn the_metrics_endpoint_is_bearer_guarded_and_absent_when_disabled() {
+        const TOKEN: &str = "metrics-scrape-token-0123456789abcdef";
+        let state_with = |metrics: Option<crate::metrics::MetricsConfig>| {
+            let mut cfg = edge_toml();
+            cfg.metrics = metrics;
+            EdgeState::for_tests(
+                TenantMode::Single(TenantId::default_tenant()),
+                vec![],
+                Arc::new(SharedInfra::for_tests()),
+                cfg,
+                1,
+            )
+        };
+        let scrape = |token: Option<&str>| {
+            let mut req = Request::builder().method(Method::GET).uri("/metrics");
+            if let Some(token) = token {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            req.extension(peer("203.0.113.1"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let enabled = state_with(Some(crate::metrics::MetricsConfig {
+            enabled: true,
+            bearer_token: Some(TOKEN.into()),
+        }));
+        for refused in [None, Some("wrong-token-wrong-token-wrong-token")] {
+            let (status, body) = send(&enabled, scrape(refused)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{refused:?}");
+            assert!(body.is_empty(), "{body}");
+        }
+        let (status, _) = send(&enabled, scrape(Some(TOKEN))).await;
+        assert_eq!(status, StatusCode::OK);
+
+        for disabled in [
+            None,
+            Some(crate::metrics::MetricsConfig {
+                enabled: false,
+                bearer_token: Some(TOKEN.into()),
+            }),
+        ] {
+            let (status, _) = send(&state_with(disabled), scrape(Some(TOKEN))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "not routed when disabled");
+        }
     }
 
     #[tokio::test]

@@ -319,9 +319,11 @@ impl EmbedSettings {
     /// fix. Runs on every build path, so it checks only what a config written
     /// before additional servers existed cannot contain: an existing
     /// single-server config never starts failing here.
-    pub fn check_mcp_servers(&self) -> Result<(), String> {
+    pub fn check_mcp_servers(&self) -> Result<(), McpConfigError> {
+        let refuse = |reason, message| Err(McpConfigError::new(reason, message));
         if self.mcp.is_none() && !self.mcp_servers.is_empty() {
-            return Err(
+            return refuse(
+                "missing_primary",
                 "mcp_servers need the primary server: set mcp before adding more servers"
                     .to_string(),
             );
@@ -330,29 +332,43 @@ impl EmbedSettings {
         for server in &self.mcp_servers {
             let field = format!("mcp_servers[{}]", server.id);
             if !valid_id(&server.id) {
-                return Err(format!(
-                    "{field}.id must be 1–64 chars of lowercase letters, digits, or dashes"
-                ));
+                return refuse(
+                    "invalid_id",
+                    format!(
+                        "{field}.id must be 1–64 chars of lowercase letters, digits, or dashes"
+                    ),
+                );
             }
             if server.id == PRIMARY_MCP_ID {
-                return Err(format!(
-                    "{field}.id: {PRIMARY_MCP_ID:?} names the primary server"
-                ));
+                return refuse(
+                    "reserved_id",
+                    format!("{field}.id: {PRIMARY_MCP_ID:?} names the primary server"),
+                );
             }
             if !seen.insert(server.id.as_str()) {
-                return Err(format!("{field}.id is used by more than one server"));
+                return refuse(
+                    "duplicate_id",
+                    format!("{field}.id is used by more than one server"),
+                );
             }
             if let Some(prefix) = server.tool_prefix.as_deref() {
                 if !valid_tool_prefix(prefix) {
-                    return Err(format!(
-                        "{field}.tool_prefix must be 1–32 chars of lowercase letters, digits, '_' or '-'"
-                    ));
+                    return refuse(
+                        "invalid_prefix",
+                        format!(
+                            "{field}.tool_prefix must be 1–32 chars of lowercase letters, digits, '_' or '-'"
+                        ),
+                    );
                 }
             }
             if server.allowed_tools.is_empty() {
-                return Err(format!("{field}.allowed_tools must name at least one tool"));
+                return refuse(
+                    "empty_allowlist",
+                    format!("{field}.allowed_tools must name at least one tool"),
+                );
             }
-            check_tool_grants(&format!("{field}.tool_grants"), &server.tool_grants)?;
+            check_tool_grants(&format!("{field}.tool_grants"), &server.tool_grants)
+                .map_err(|message| McpConfigError::new("invalid_grant", message))?;
             if let Some(prefix) = server.tool_prefix.as_deref() {
                 let inside = format!("{prefix}.");
                 if let Some(entry) = server
@@ -361,9 +377,12 @@ impl EmbedSettings {
                     .into_iter()
                     .find(|e| !e.starts_with(&inside))
                 {
-                    return Err(format!(
-                        "{field}: {entry:?} can never match; this server's tools are named {prefix}.<tool>"
-                    ));
+                    return refuse(
+                        "outside_prefix",
+                        format!(
+                            "{field}: {entry:?} can never match; this server's tools are named {prefix}.<tool>"
+                        ),
+                    );
                 }
             }
         }
@@ -374,7 +393,7 @@ impl EmbedSettings {
             .enumerate()
             .flat_map(|(i, a)| specs[i + 1..].iter().map(move |b| (a, b)))
             .find_map(|(a, b)| a.overlap_with(b))
-            .map_or(Ok(()), Err)
+            .map_or(Ok(()), |message| refuse("name_collision", message))
     }
 
     /// Drop every server's discovery credential, for a revision snapshot.
@@ -848,22 +867,31 @@ impl<'a> McpServerSpec<'a> {
         }
     }
 
-    fn check_connection(&self) -> Result<(), String> {
+    fn check_connection(&self) -> Result<(), McpConfigError> {
         let field = self.field();
         match (self.connection.audience.as_deref(), self.connection.auth) {
             (Some(a), _) if a.trim().is_empty() => {
-                return Err(format!("{field}.audience must not be blank"))
+                return Err(McpConfigError::new(
+                    "invalid_audience",
+                    format!("{field}.audience must not be blank"),
+                ))
             }
             (Some(_), McpAuth::Forwarded) => {
-                return Err(format!(
-                    "{field}.audience applies only to auth = \"exchanged\"; a forwarded server gets the customer's own token"
+                return Err(McpConfigError::new(
+                    "invalid_audience",
+                    format!(
+                        "{field}.audience applies only to auth = \"exchanged\"; a forwarded server gets the customer's own token"
+                    ),
                 ))
             }
             _ => {}
         }
         if self.required && self.connection.unavailable_skip_secs.is_some() {
-            return Err(format!(
-                "{field}.unavailable_skip_secs applies only to a server that is not required; a required server is never skipped"
+            return Err(McpConfigError::new(
+                "skip_on_required",
+                format!(
+                    "{field}.unavailable_skip_secs applies only to a server that is not required; a required server is never skipped"
+                ),
             ));
         }
         Ok(())
@@ -885,6 +913,28 @@ impl<'a> McpServerSpec<'a> {
             })
     }
 }
+
+/// Why [`EmbedSettings::check_mcp_servers`] refused a config: a stable
+/// `reason` to count refusals by, and the message naming the field to fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpConfigError {
+    pub reason: &'static str,
+    pub message: String,
+}
+
+impl McpConfigError {
+    fn new(reason: &'static str, message: String) -> Self {
+        Self { reason, message }
+    }
+}
+
+impl std::fmt::Display for McpConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for McpConfigError {}
 
 /// An allowlist entry in LLM-name space (`.` → `_`), where two servers' tools
 /// collide: an exact name, or a `prefix.*` namespace.
@@ -1684,7 +1734,17 @@ mod mcp_server_tests {
     }
 
     fn refused(embed: &EmbedSettings) -> String {
-        embed.check_mcp_servers().expect_err("must be refused")
+        embed
+            .check_mcp_servers()
+            .expect_err("must be refused")
+            .message
+    }
+
+    fn reason(embed: &EmbedSettings) -> &'static str {
+        embed
+            .check_mcp_servers()
+            .expect_err("must be refused")
+            .reason
     }
 
     /// The serialised form of a config that names none of the new keys is
@@ -1900,6 +1960,10 @@ mod mcp_server_tests {
             server("crm", None, &["crm.*"]),
             server("leads", None, &["crm.leads.list"]),
         ]);
+        assert_eq!(reason(&two), "name_collision");
+        assert_eq!(reason(&orphan), "missing_primary");
+        assert_eq!(reason(&dup), "duplicate_id");
+        assert_eq!(reason(&outside), "outside_prefix");
         assert!(refused(&two)
             .contains(r#"mcp_servers[leads]: "crm.leads.list" overlaps "crm.*" on server crm"#));
 
