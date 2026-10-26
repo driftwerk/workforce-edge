@@ -65,7 +65,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 # The `edge_mcp_*` metrics and their Prometheus exposition at `/metrics`, the
 # same facade and exporter versions the core crates use.
-metrics = "0.24"
+metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = { workspace = true }
