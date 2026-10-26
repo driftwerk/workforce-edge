@@ -655,6 +655,16 @@ pub fn allowlist_admits(entries: &[String], tool: &str) -> bool {
     })
 }
 
+/// Whether a closed allowlist could admit `tool` as the model names it, where
+/// `.` and `_` are one character — so a tool's dotted and wire forms answer
+/// alike.
+pub fn allowlist_admits_on_the_wire(entries: &[String], tool: &str) -> bool {
+    let tool = ToolPattern::Exact(workforce_agent::runner::to_llm_name(tool));
+    entries
+        .iter()
+        .any(|entry| ToolPattern::parse(entry).overlaps(&tool))
+}
+
 /// The id the primary `[embed.mcp]` server goes by in logs and messages, and
 /// which no additional server may take.
 pub const PRIMARY_MCP_ID: &str = "default";
@@ -1531,6 +1541,22 @@ requires = "admin""#,
         assert!(!e.tool_allowed("harborx"));
         assert!(!e.tool_allowed("other.tool"));
         assert!(!e.tool_allowed("pingx"));
+    }
+
+    #[test]
+    fn allowlist_admits_on_the_wire_treats_dot_and_underscore_alike() {
+        let entries = ["harbor.*".to_string(), "ping.pong".to_string()];
+        for tool in [
+            "harbor.list_orders",
+            "harbor_list_orders",
+            "harbor",
+            "ping_pong",
+        ] {
+            assert!(allowlist_admits_on_the_wire(&entries, tool), "{tool}");
+        }
+        for tool in ["harborx", "harborx_list", "ping", "other.tool"] {
+            assert!(!allowlist_admits_on_the_wire(&entries, tool), "{tool}");
+        }
     }
 
     #[test]

@@ -35,7 +35,9 @@ use workforce_mcp_client::{
     AuthProvider, McpClient, McpError, McpLimits, McpToolDef, NoAuth, StaticBearer, ToolNameInfo,
 };
 
-use crate::agent::{allowlist_admits, EmbedSettings, McpAuth, McpServerSpec};
+use crate::agent::{
+    allowlist_admits, allowlist_admits_on_the_wire, EmbedSettings, McpAuth, McpServerSpec,
+};
 use crate::host::BUILT_IN_TOOLS;
 use crate::metrics::{self, AgentScope, CacheResult, CallOutcome, DiscoveryPhase};
 use crate::outbound::{self, OutboundPolicy};
@@ -497,9 +499,12 @@ impl McpToolset {
         self
     }
 
+    /// Serve every tool under `prefix`, as `tool_prefix = prefix` with
+    /// `allowed_tools = ["prefix.*"]` would.
     #[cfg(test)]
     pub(crate) fn set_tool_prefix_for_test(&mut self, prefix: &str) {
         self.tool_prefix = Some(prefix.into());
+        self.catalogue = vec![format!("{prefix}.*")];
     }
 
     /// A toolset with no tools and no server, for tests that drive a turn
@@ -817,14 +822,18 @@ impl McpCatalogue {
 
     /// `tool` with its serving server's prefix removed, so a prefixed tool
     /// labels exactly as it would unprefixed. Accepts the dotted or the LLM
-    /// form; unprefixed names come back as they are.
+    /// form; a built-in, and a tool no prefixed server serves, come back as
+    /// they are.
     pub fn local_tool_name<'a>(&self, tool: &'a str) -> &'a str {
+        if shadows_builtin(tool) {
+            return tool;
+        }
         self.servers
             .iter()
-            .filter_map(|s| s.tool_prefix.as_deref())
-            .find_map(|prefix| {
-                tool.strip_prefix(prefix)
-                    .and_then(|rest| rest.strip_prefix(['.', '_']))
+            .filter(|s| allowlist_admits_on_the_wire(&s.catalogue, tool))
+            .find_map(|s| {
+                tool.strip_prefix(s.tool_prefix.as_deref()?)?
+                    .strip_prefix(['.', '_'])
             })
             .unwrap_or(tool)
     }
@@ -2185,6 +2194,16 @@ pub(crate) mod tests {
             "harbor.list_orders"
         );
         assert_eq!(catalogue.local_tool_name("docsx.list"), "docsx.list");
+
+        let mut data = McpToolset::empty();
+        data.set_tool_prefix_for_test("data");
+        let catalogue = McpCatalogue::of(vec![McpToolset::empty(), data]);
+        assert_eq!(
+            catalogue.local_tool_name("data.query"),
+            "data.query",
+            "a built-in keeps its own name"
+        );
+        assert_eq!(catalogue.local_tool_name("data.orders"), "orders");
     }
 
     #[tokio::test]
