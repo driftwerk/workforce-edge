@@ -476,9 +476,12 @@ impl McpToolset {
     pub(crate) async fn force_defs_stale(&self) -> bool {
         match Instant::now().checked_sub(MCP_DEFS_TTL + Duration::from_secs(1)) {
             Some(past) => {
-                if let Some(cached) = self.defs.write().await.as_mut() {
-                    cached.at = past;
-                }
+                self.defs
+                    .write()
+                    .await
+                    .as_mut()
+                    .expect("only discovered defs can go stale")
+                    .at = past;
                 true
             }
             None => false,
@@ -1958,6 +1961,7 @@ pub(crate) mod tests {
         docs_server.connection.discovery_credential = Some("docs-cred".into());
         settings.mcp_servers = vec![docs_server];
         let catalogue = build(&settings).await.unwrap();
+        catalogue.settled().await;
         if !catalogue.servers()[1].force_defs_stale().await {
             return; // monotonic clock can't represent the offset; skip
         }
