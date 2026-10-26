@@ -967,7 +967,7 @@ function AgentEditor({
           <McpConnectionFields
             value={integ.mcp}
             onChange={(mcp) => setInt("mcp", mcp)}
-            hasCredential={agent?.mcp_settings?.has_discovery_credential ?? false}
+            hasCredential={!!integ.mcp.url.trim() && (agent?.mcp_settings?.has_discovery_credential ?? false)}
             readOnly={readOnly}
             urlLabel="Company MCP URL"
             urlHint="the primary server the agent's tools live on; blank = pure chat"
