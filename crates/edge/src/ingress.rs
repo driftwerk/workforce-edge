@@ -164,6 +164,21 @@ pub fn bearer_token(headers: &HeaderMap, query_token: Option<&str>) -> Option<St
         .filter(|t| !t.is_empty())
 }
 
+/// The SHA-256 of a bearer token: what a guard keeps and compares, never the
+/// token itself.
+pub(crate) type TokenDigest = [u8; 32];
+
+pub(crate) fn token_digest(token: &str) -> TokenDigest {
+    use sha2::Digest;
+    sha2::Sha256::digest(token.as_bytes()).into()
+}
+
+/// Whether two digests are equal, in time that does not depend on where
+/// they first differ.
+pub(crate) fn digests_match(a: &TokenDigest, b: &TokenDigest) -> bool {
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 pub use workforce_memory::edge_owner::{external_owner, is_customer_owner};
 
 /// Parse the configured trusted-proxy CIDRs, skipping (with a warning) any that

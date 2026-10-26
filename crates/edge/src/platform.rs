@@ -52,7 +52,9 @@ use workforce_common::postgres::PostgresPool;
 use crate::admin::{AdminAuth, AdminConfig, AdminOidc};
 use crate::boot::SessionRoot;
 use crate::config_store::{EdgeAuditStore, EdgeOperatorStore, Operator};
-use crate::ingress::{client_ip, request_host, RateLimiter};
+use crate::ingress::{
+    client_ip, digests_match, request_host, token_digest, RateLimiter, TokenDigest,
+};
 use crate::outbound::OutboundPolicy;
 use crate::server::EdgeState;
 use crate::settings::LlmStatus;
@@ -376,21 +378,6 @@ impl PlatformState {
             rescue.expires = now;
         }
     }
-}
-
-/// The SHA-256 of a bearer token: what the platform keeps and compares,
-/// never the token itself.
-type TokenDigest = [u8; 32];
-
-fn token_digest(token: &str) -> TokenDigest {
-    use sha2::Digest;
-    sha2::Sha256::digest(token.as_bytes()).into()
-}
-
-/// Whether two digests are equal, in time that does not depend on where
-/// they first differ.
-fn digests_match(a: &TokenDigest, b: &TokenDigest) -> bool {
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// The platform's action log: one row per change the API made to a tenant,

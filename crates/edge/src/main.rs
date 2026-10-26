@@ -38,6 +38,10 @@ async fn main() -> Result<()> {
     let config = EdgeConfig::load(&config_path)
         .wrap_err_with(|| format!("loading edge config from {}", config_path.display()))?;
 
+    if config.metrics.as_ref().is_some_and(|m| m.enabled) {
+        workforce_edge::metrics::install_recorder();
+    }
+
     tracing::info!(
         bind = %config.server.bind,
         "workforce-edge configured; connecting to its own data plane"
