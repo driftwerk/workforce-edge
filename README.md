@@ -48,6 +48,37 @@ config.
 Edge builds against the Workforce core crates, pinned to one revision in
 `Cargo.toml`. To work against a local core checkout, see `.cargo/config.toml`.
 
+## Metrics
+
+With `[metrics] enabled = true`, the edge serves Prometheus metrics at
+`GET /metrics`. A scraper must send `Authorization: Bearer <bearer_token>`.
+The token is at least 32 characters, and the endpoint is never served without
+one. With `[metrics]` absent or disabled, the route does not exist and nothing
+is recorded.
+
+Every label value comes from configuration or a fixed set, so the number of
+series is bounded by the config. Labels never carry a customer, a token, a
+tool's arguments or a URL.
+
+- `agent` and `server` are ids from the agent config. The primary server is
+  `default`.
+- `tool` is an allowlisted name.
+- `audience` is a configured audience, or `none` for an exchange that asks for
+  no audience.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `edge_mcp_discovery_total` | counter | `agent`, `server`, `phase` (`startup`, `lazy`, `refresh`), `outcome` (`ok`, `failed`, `timed_out`) |
+| `edge_mcp_discovery_duration_seconds` | histogram | `agent`, `server`, `phase` |
+| `edge_mcp_tools_cache_total` | counter | `agent`, `server`, `result` (`hit`, `miss`, `stale`) |
+| `edge_mcp_tool_calls_total` | counter | `agent`, `server`, `tool`, `outcome` (`ok`, `tool_error`, `transport_error`, `timeout`) |
+| `edge_mcp_tool_call_duration_seconds` | histogram | `agent`, `server`, `tool` |
+| `edge_mcp_server_skipped_total` | counter | `agent`, `server`. A turn skipped a server inside its skip window. |
+| `edge_mcp_skip_window_entered_total` | counter | `agent`, `server`. A timed-out turn start opened a server's skip window. |
+| `edge_mcp_token_exchanges_total` | counter | `agent`, `audience`, `outcome` (`ok`, `failed`) |
+| `edge_mcp_token_exchange_duration_seconds` | histogram | `agent`, `audience` |
+| `edge_mcp_config_refusals_total` | counter | `reason`, one of `missing_primary`, `invalid_id`, `reserved_id`, `duplicate_id`, `invalid_prefix`, `empty_allowlist`, `invalid_grant`, `outside_prefix`, `invalid_audience`, `skip_on_required`, `name_collision` |
+
 ## Docker
 
 Every push to `main` publishes `kingsleyh/driftwerk-edge:sha-<commit>` (and
