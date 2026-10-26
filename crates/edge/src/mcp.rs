@@ -11,10 +11,11 @@
 //! (`EdgeMcpTool` → `McpClient` → transport) into the runner's spawned tool
 //! task — so the token reaches `tools/call` without any task-local or shared
 //! `SessionContext` change. Tool schemas are discovered once and cached: at
-//! startup if a service `discovery_credential` is configured, otherwise lazily
-//! on the first customer turn using that customer's own token (for MCP servers
-//! that accept any valid user token). Install-agnostic — nothing here is
-//! specific to any one deployment.
+//! startup if a service `discovery_credential` is configured (awaited for a
+//! required server, in the background for any other), otherwise lazily on the
+//! first customer turn using that customer's own token (for MCP servers that
+//! accept any valid user token). Install-agnostic — nothing here is specific
+//! to any one deployment.
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
@@ -24,9 +25,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use eyre::{eyre, Result, WrapErr};
-use futures::future::join_all;
+use futures::future::{join_all, try_join_all};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use url::Url;
 use workforce_agent::runner::to_llm_name;
 use workforce_agent::tools::registry::ToolRegistry;
@@ -215,7 +217,7 @@ pub struct McpToolset {
     /// Whether this server being unavailable fails startup and the turn.
     required: bool,
     /// How long a server that is not required is skipped after a timed-out
-    /// turn start; zero never skips.
+    /// startup discovery or turn start; zero never skips.
     unavailable_skip: Duration,
     /// Deadline on every turn-start operation.
     handshake_timeout: Duration,
@@ -443,7 +445,7 @@ impl McpToolset {
     }
 
     /// Whether this server sits out the turn: only a server that is not
-    /// required, and only inside the window after a timed-out turn start.
+    /// required, and only inside the window after a timeout.
     fn in_skip_window(&self) -> bool {
         !self.required
             && self
@@ -453,7 +455,8 @@ impl McpToolset {
                 .is_some_and(|until| Instant::now() < until)
     }
 
-    /// Start the skip window after a timed-out turn start.
+    /// Start the skip window after a timed-out startup discovery or turn
+    /// start.
     fn note_timeout(&self) {
         if self.required || self.unavailable_skip.is_zero() {
             return;
@@ -679,6 +682,59 @@ impl TurnAuth {
     }
 }
 
+/// The startup discovery of the servers that are not required, run off the
+/// build so an unreachable one holds neither boot nor an admin save. Cancelled
+/// when its catalogue is retired or the last clone of it is dropped.
+#[derive(Default)]
+struct BackgroundDiscovery {
+    cancel: CancellationToken,
+    tasks: TaskTracker,
+}
+
+impl BackgroundDiscovery {
+    /// Discover `server` in the background. The outcome is metered by
+    /// [`McpToolset::discover_at_startup`] and logged here; a timeout opens
+    /// the server's skip window, so the first turns do not wait on it again.
+    fn spawn(&self, server: McpToolset) {
+        let cancel = self.cancel.clone();
+        self.tasks.spawn(async move {
+            match cancel
+                .run_until_cancelled(server.discover_at_startup())
+                .await
+            {
+                None => {}
+                Some(Ok(())) => tracing::info!(
+                    agent = server.scope.agent(),
+                    server = %server.id,
+                    phase = "startup_discovery",
+                    outcome = "ok",
+                    tools = ?server.tool_names(),
+                    "MCP server discovered"
+                ),
+                Some(Err(e)) => {
+                    if timed_out(&e) {
+                        server.note_timeout();
+                    }
+                    tracing::warn!(
+                        agent = server.scope.agent(),
+                        server = %server.id,
+                        phase = "startup_discovery",
+                        outcome = outcome_of(&e),
+                        error = %format!("{e:#}"),
+                        "MCP server unavailable"
+                    )
+                }
+            }
+        });
+    }
+}
+
+impl Drop for BackgroundDiscovery {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 /// Every company MCP server one agent uses, the primary first. Empty for a
 /// tool-less, pure-chat agent.
 #[derive(Clone, Default)]
@@ -689,19 +745,29 @@ pub struct McpCatalogue {
     /// audience-scoped downstream token per turn instead of forwarding the
     /// customer's raw token.
     exchanger: Option<Arc<TokenExchanger>>,
+    background: Arc<BackgroundDiscovery>,
 }
 
 impl McpCatalogue {
-    /// Check the agent's servers, prepare each one, then discover at startup:
-    /// a required server's failure fails the build (fail-closed), another's is
-    /// logged and left to the first turn. Every server is reached under
-    /// `policy`.
+    /// Check the agent's servers, prepare each one, then [`Self::start`]
+    /// them. Every server is reached under `policy`.
     pub async fn build(
         scope: AgentScope,
         embed: &EmbedSettings,
         policy: OutboundPolicy,
         exchanger: Option<Arc<TokenExchanger>>,
     ) -> Result<Self> {
+        let servers = Self::prepare(&scope, embed, policy, exchanger.as_deref())?;
+        Self::start(scope, servers, exchanger).await
+    }
+
+    /// Check the agent's servers and prepare each one; nothing is dialled.
+    fn prepare(
+        scope: &AgentScope,
+        embed: &EmbedSettings,
+        policy: OutboundPolicy,
+        exchanger: Option<&TokenExchanger>,
+    ) -> Result<Vec<McpToolset>> {
         embed.check_mcp_servers().map_err(|e| {
             metrics::config_refused(e.reason);
             eyre::Report::new(e)
@@ -719,31 +785,47 @@ impl McpCatalogue {
                     )
                 });
         }
-        let install_audience = exchanger.as_deref().and_then(TokenExchanger::audience);
-        let servers = specs
+        let install_audience = exchanger.and_then(TokenExchanger::audience);
+        specs
             .iter()
-            .map(|spec| McpToolset::prepare(&scope, spec, policy, install_audience))
-            .collect::<Result<Vec<_>>>()?;
-        let discovered = join_all(servers.iter().map(McpToolset::discover_at_startup)).await;
-        for (server, outcome) in servers.iter().zip(discovered) {
-            match outcome {
-                Err(e) if server.required => return Err(e),
-                Err(e) => tracing::warn!(
-                    agent = scope.agent(),
-                    server = %server.id,
-                    phase = "startup_discovery",
-                    outcome = outcome_of(&e),
-                    error = %format!("{e:#}"),
-                    "MCP server unavailable"
-                ),
-                Ok(()) => {}
-            }
-        }
+            .map(|spec| McpToolset::prepare(scope, spec, policy, install_audience))
+            .collect()
+    }
+
+    /// Discover at startup. A required server's discovery is awaited and its
+    /// failure fails the build (fail-closed). Every other server with a
+    /// discovery credential is discovered in the background: its tools appear
+    /// once found, and a turn before then discovers it lazily.
+    async fn start(
+        scope: AgentScope,
+        servers: Vec<McpToolset>,
+        exchanger: Option<Arc<TokenExchanger>>,
+    ) -> Result<Self> {
+        let background = Arc::new(BackgroundDiscovery::default());
+        servers
+            .iter()
+            .filter(|s| !s.required && s.discovery_credential.is_some())
+            .for_each(|s| background.spawn(s.clone()));
+        background.tasks.close();
+        try_join_all(
+            servers
+                .iter()
+                .filter(|s| s.required)
+                .map(McpToolset::discover_at_startup),
+        )
+        .await?;
         Ok(Self {
             scope,
             servers,
             exchanger,
+            background,
         })
+    }
+
+    /// Stop the background discovery now rather than when the last clone
+    /// goes: a replaced host can outlive its swap while a turn finishes on it.
+    pub fn retire(&self) {
+        self.background.cancel.cancel();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -843,10 +925,15 @@ impl McpCatalogue {
     #[cfg(test)]
     pub(crate) fn of(servers: Vec<McpToolset>) -> Self {
         Self {
-            scope: AgentScope::default(),
             servers,
-            exchanger: None,
+            ..Self::default()
         }
+    }
+
+    /// Wait for the background discovery to finish or be cancelled.
+    #[cfg(test)]
+    pub(crate) async fn settled(&self) {
+        self.background.tasks.wait().await;
     }
 
     #[cfg(test)]
@@ -1113,6 +1200,26 @@ pub(crate) mod tests {
 
     async fn build(embed: &EmbedSettings) -> Result<McpCatalogue> {
         McpCatalogue::build(scope(), embed, OutboundPolicy::Private, None).await
+    }
+
+    /// [`build`] with every server's turn-start operations bounded by `limit`.
+    async fn build_with_timeout(embed: &EmbedSettings, limit: Duration) -> Result<McpCatalogue> {
+        let servers = McpCatalogue::prepare(&scope(), embed, OutboundPolicy::Private, None)?
+            .into_iter()
+            .map(|s| s.with_handshake_timeout(limit))
+            .collect();
+        McpCatalogue::start(scope(), servers, None).await
+    }
+
+    /// A primary with `harbor.*` and a startup credential, plus `docs`: an
+    /// optional server at `docs_url` with a credential of its own.
+    fn with_optional_docs(primary_url: &str, docs_url: &str) -> EmbedSettings {
+        let mut settings = embed(primary_url, Some("svc-cred"));
+        settings.allowed_tools = vec!["harbor.*".into()];
+        let mut docs = extra("docs", docs_url, Some("docs"), &["docs.*"]);
+        docs.connection.discovery_credential = Some("docs-cred".into());
+        settings.mcp_servers = vec![docs];
+        settings
     }
 
     fn customer() -> TokenCell {
@@ -1392,7 +1499,7 @@ pub(crate) mod tests {
     }
 
     /// A server whose `initialize` answers only after `delay`.
-    async fn slow_mcp(delay: Duration) -> MockServer {
+    pub(crate) async fn slow_mcp(delay: Duration) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(move |req: &Request| {
@@ -1496,6 +1603,7 @@ pub(crate) mod tests {
         docs_server.connection.discovery_credential = Some("docs-cred".into());
         settings.mcp_servers = vec![docs_server];
         let catalogue = build(&settings).await.expect("an optional server degrades");
+        catalogue.settled().await;
         assert_eq!(catalogue.servers()[1].tool_names(), Vec::<String>::new());
 
         // The server recovers: the first turn discovers it lazily.
@@ -1513,6 +1621,118 @@ pub(crate) mod tests {
             .await;
         let registry = catalogue.registry_for(&customer()).await.unwrap();
         assert!(registry.has("harbor.list_orders") && registry.has("docs.search"));
+    }
+
+    /// An optional server's startup discovery runs off the build: its tools
+    /// appear once found, without a turn having to discover them.
+    #[tokio::test]
+    async fn an_optional_servers_tools_appear_once_discovered_in_the_background() {
+        let primary = mock_mcp(&["harbor.list_orders"]).await;
+        let docs = mock_mcp(&["search"]).await;
+        let catalogue = build(&with_optional_docs(&primary.uri(), &docs.uri()))
+            .await
+            .unwrap();
+        catalogue.settled().await;
+        assert_eq!(catalogue.servers()[1].tool_names(), vec!["docs.search"]);
+        assert_eq!(bearers(&docs).await[0], "Bearer docs-cred");
+        let registry = catalogue.registry_for(&customer()).await.unwrap();
+        assert!(registry.has("harbor.list_orders") && registry.has("docs.search"));
+        assert_eq!(
+            rpc_count(&docs, "tools/list").await,
+            1,
+            "no lazy re-discovery"
+        );
+    }
+
+    /// A blackholed optional server holds neither the build nor the first
+    /// turn: the build returns before its discovery could time out, the
+    /// timeout is metered and opens its skip window, and the turn goes on
+    /// without it.
+    #[test]
+    fn a_blackholed_optional_server_does_not_hold_the_build() {
+        const LIMIT: Duration = Duration::from_secs(2);
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let primary = mock_mcp(&["harbor.list_orders"]).await;
+                let blackhole = slow_mcp(Duration::from_secs(600)).await;
+                let started = Instant::now();
+                let catalogue = build_with_timeout(
+                    &with_optional_docs(&primary.uri(), &blackhole.uri()),
+                    LIMIT,
+                )
+                .await
+                .unwrap();
+                assert!(started.elapsed() < LIMIT / 2, "{:?}", started.elapsed());
+                assert_eq!(
+                    catalogue.servers()[0].tool_names(),
+                    vec!["harbor.list_orders"]
+                );
+
+                catalogue.settled().await;
+                assert!(catalogue.servers()[1].in_skip_window());
+                let turn = Instant::now();
+                let registry = catalogue.registry_for(&customer()).await.unwrap();
+                assert!(turn.elapsed() < LIMIT / 2, "{:?}", turn.elapsed());
+                assert!(registry.has("harbor.list_orders") && !registry.has("docs.search"));
+            })
+        });
+        let recorded = crate::metrics::tests::recorded(&snapshotter);
+        let count = |key: &str| recorded.get(key).copied().unwrap_or(0);
+        let agent = "agent=northwind-help";
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_discovery_total{{{agent},outcome=timed_out,phase=startup,server=docs,tenant=acme}}"
+            )),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_skip_window_entered_total{{{agent},server=docs,tenant=acme}}"
+            )),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "edge_mcp_server_skipped_total{{{agent},server=docs,tenant=acme}}"
+            )),
+            1
+        );
+    }
+
+    /// Retiring a catalogue, or dropping its last clone, cancels the
+    /// background discovery it still has in flight.
+    #[tokio::test]
+    async fn retiring_or_dropping_a_catalogue_cancels_its_background_discovery() {
+        let primary = mock_mcp(&["harbor.list_orders"]).await;
+        let blackhole = slow_mcp(Duration::from_secs(600)).await;
+        let settings = with_optional_docs(&primary.uri(), &blackhole.uri());
+        let prompt = Duration::from_secs(5);
+
+        let retired = build(&settings).await.unwrap();
+        retired.retire();
+        tokio::time::timeout(prompt, retired.settled())
+            .await
+            .expect("retire cancels the discovery");
+        assert!(
+            !retired.servers()[1].in_skip_window(),
+            "a cancelled discovery is no outcome"
+        );
+
+        let dropped = build(&settings).await.unwrap();
+        let tasks = dropped.background.tasks.clone();
+        let clone = dropped.clone();
+        drop(dropped);
+        assert!(!tasks.is_empty(), "a clone keeps it running");
+        drop(clone);
+        tokio::time::timeout(prompt, tasks.wait())
+            .await
+            .expect("dropping the last clone cancels the discovery");
     }
 
     /// Today's contract, kept by the `required` default: a primary that cannot

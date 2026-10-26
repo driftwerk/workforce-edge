@@ -776,7 +776,8 @@ impl TenantRuntime {
                 .wrap_err_with(|| format!("rebuilding host {id} on git sync"))?;
             new_hosts.insert(id, Arc::new(host));
         }
-        *self.hosts.write().expect("hosts lock") = new_hosts;
+        let retired = std::mem::replace(&mut *self.hosts.write().expect("hosts lock"), new_hosts);
+        retired.values().for_each(|host| host.retire());
         *self.last_synced_sha.lock().expect("sync sha") = Some(sha.clone());
         tracing::info!(
             tenant = %self.id, commit = %sha, agents = tree.agents.len(),
@@ -852,7 +853,8 @@ impl TenantRuntime {
     /// Unmount an agent host. Caller must hold `edit_lock` to serialize against
     /// concurrent edits/creates.
     pub(crate) fn remove_host(&self, agent_id: &str) {
-        self.hosts.write().expect("hosts lock").remove(agent_id);
+        let removed = self.hosts.write().expect("hosts lock").remove(agent_id);
+        removed.iter().for_each(|host| host.retire());
     }
 
     /// Reload every playbook from the store and hot-swap the catalog — called
@@ -883,10 +885,12 @@ impl TenantRuntime {
             .await
             .wrap_err("rebuilding agent host")?;
         self.config_store.upsert(&agent).await?;
-        self.hosts
+        let replaced = self
+            .hosts
             .write()
             .expect("hosts lock")
             .insert(agent.id.clone(), Arc::new(host));
+        replaced.iter().for_each(|host| host.retire());
         Ok(())
     }
 }
