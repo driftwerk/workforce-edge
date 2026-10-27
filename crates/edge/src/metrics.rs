@@ -274,6 +274,14 @@ pub(crate) fn skip_window_entered(scope: &AgentScope, server: &str) {
         .increment(1);
 }
 
+/// A build left out a server that is not required because its URL cannot be
+/// used; `reason` is `missing_url`, `invalid_url` or `refused_url`.
+pub(crate) fn server_excluded(scope: &AgentScope, server: &str, reason: &'static str) {
+    let (tenant, agent) = scope.labels();
+    metrics::counter!("edge_mcp_server_excluded_total", "tenant" => tenant, "agent" => agent, "server" => server.to_string(), "reason" => reason)
+        .increment(1);
+}
+
 /// The label an exchange's audience is counted under: the configured value,
 /// or `none` for an exchange that asks for no audience.
 fn audience_label(audience: Option<&str>) -> String {
@@ -413,6 +421,7 @@ pub(crate) mod tests {
             );
             server_skipped(&scope, "docs");
             skip_window_entered(&scope, "docs");
+            server_excluded(&scope, "docs", "missing_url");
             token_exchange(&scope, None, "ok", Duration::from_millis(5));
             config_refused("name_collision");
         });
@@ -426,6 +435,7 @@ pub(crate) mod tests {
             "edge_mcp_tool_calls_total{agent=northwind-help,outcome=unreachable,server=docs,tenant=acme,tool=docs.fetch}",
             "edge_mcp_server_skipped_total{agent=northwind-help,server=docs,tenant=acme}",
             "edge_mcp_skip_window_entered_total{agent=northwind-help,server=docs,tenant=acme}",
+            "edge_mcp_server_excluded_total{agent=northwind-help,reason=missing_url,server=docs,tenant=acme}",
             "edge_mcp_token_exchanges_total{agent=northwind-help,audience=none,outcome=ok,tenant=acme}",
             "edge_mcp_token_exchange_duration_seconds{agent=northwind-help,audience=none,tenant=acme}",
             "edge_mcp_config_refusals_total{reason=name_collision}",

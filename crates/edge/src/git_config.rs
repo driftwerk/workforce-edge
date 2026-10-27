@@ -506,9 +506,20 @@ pub(crate) mod tests {
         git_ref: &str,
         pairs: &[(&str, &str)],
     ) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        mount_zipball(&server, repo, git_ref, pairs).await;
+        server
+    }
+
+    /// Serve `pairs` on `server` as the zipball of `repo` at `git_ref`.
+    async fn mount_zipball(
+        server: &wiremock::MockServer,
+        repo: &str,
+        git_ref: &str,
+        pairs: &[(&str, &str)],
+    ) {
         use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
+        use wiremock::{Mock, ResponseTemplate};
         Mock::given(method("GET"))
             .and(path(format!("/repos/{repo}/zipball/{git_ref}")))
             .respond_with(
@@ -516,9 +527,27 @@ pub(crate) mod tests {
                     .insert_header("content-type", "application/zip")
                     .set_body_bytes(zipball(pairs)),
             )
-            .mount(&server)
+            .mount(server)
             .await;
-        server
+    }
+
+    /// Serve `pairs` on `server` as commit `sha` of `repo` at `git_ref`: its
+    /// HEAD SHA and its zipball.
+    pub(crate) async fn serve_commit(
+        server: &wiremock::MockServer,
+        repo: &str,
+        git_ref: &str,
+        sha: &str,
+        pairs: &[(&str, &str)],
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/{repo}/commits/{git_ref}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sha))
+            .mount(server)
+            .await;
+        mount_zipball(server, repo, git_ref, pairs).await;
     }
 
     /// An archive whose config entry inflates past the per-entry cap is

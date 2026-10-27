@@ -120,7 +120,9 @@ url = "https://mcp.harbor.example"
 #   [token_exchange] audience. Only with auth = "exchanged".
 # - required: whether this server being unavailable fails startup and the
 #   turn. Default true here (the primary server) and false on an additional
-#   server, whose outage only removes its tools for that turn.
+#   server, whose outage only removes its tools for that turn. A server that
+#   is not required and whose url cannot be used is left out of the agent
+#   rather than failing it.
 # - unavailable_skip_secs: how long a server that is not required sits out
 #   after its startup discovery or turn start timed out or could not reach it
 #   (connection refused, DNS, TLS, connect timeout). A server that answers
