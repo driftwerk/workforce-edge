@@ -42,7 +42,7 @@ use crate::agent::{
 };
 use crate::host::BUILT_IN_TOOLS;
 use crate::metrics::{self, AgentScope, CacheResult, CallOutcome, DiscoveryPhase};
-use crate::outbound::{self, OutboundPolicy};
+use crate::outbound::{self, OutboundError, OutboundPolicy};
 use crate::token_exchange::TokenExchanger;
 
 /// Cap on a single company-MCP `tools/call` result body — well above the
@@ -76,18 +76,32 @@ const MCP_DEFS_TTL: Duration = Duration::from_secs(300);
 const MAX_TOOL_NAME_LEN: usize = 64;
 
 /// Why an MCP operation under [`deadline`] did not produce a value. A timeout
-/// is told apart so a stalled server can be skipped for a while; a fast
-/// failure is retried on the next turn.
+/// or an unreachable server is told apart so a server that is down can be
+/// skipped for a while; any other failure is retried on the next turn.
 #[derive(Debug)]
 pub(crate) enum McpOpError {
     Failed { op: &'static str, detail: String },
+    Unreachable { op: &'static str, detail: String },
     TimedOut { op: &'static str, secs: u64 },
+}
+
+impl McpOpError {
+    fn of(op: &'static str, error: McpError) -> Self {
+        let detail = error.to_string();
+        if error.is_unreachable() {
+            Self::Unreachable { op, detail }
+        } else {
+            Self::Failed { op, detail }
+        }
+    }
 }
 
 impl std::fmt::Display for McpOpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Failed { op, detail } => write!(f, "MCP {op} failed: {detail}"),
+            Self::Failed { op, detail } | Self::Unreachable { op, detail } => {
+                write!(f, "MCP {op} failed: {detail}")
+            }
             Self::TimedOut { op, secs } => write!(f, "MCP {op} timed out after {secs}s"),
         }
     }
@@ -95,22 +109,15 @@ impl std::fmt::Display for McpOpError {
 
 impl std::error::Error for McpOpError {}
 
-/// Run an MCP operation under a hard deadline, flattening timeout and protocol
-/// errors into one [`McpOpError`].
-async fn deadline<T, E>(
+/// Run an MCP operation under a hard deadline, classifying its failure as an
+/// [`McpOpError`].
+async fn deadline<T>(
     op: &'static str,
     limit: Duration,
-    fut: impl Future<Output = Result<T, E>>,
-) -> Result<T, McpOpError>
-where
-    E: std::fmt::Display,
-{
+    fut: impl Future<Output = Result<T, McpError>>,
+) -> Result<T, McpOpError> {
     match tokio::time::timeout(limit, fut).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(McpOpError::Failed {
-            op,
-            detail: error.to_string(),
-        }),
+        Ok(result) => result.map_err(|error| McpOpError::of(op, error)),
         Err(_) => Err(McpOpError::TimedOut {
             op,
             secs: limit.as_secs(),
@@ -118,19 +125,34 @@ where
     }
 }
 
-fn timed_out(error: &eyre::Report) -> bool {
-    matches!(
-        error.downcast_ref::<McpOpError>(),
-        Some(McpOpError::TimedOut { .. })
-    )
+/// Why a server counts as down rather than as having answered badly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unavailable {
+    TimedOut,
+    Unreachable,
 }
 
-/// The `outcome` a failed MCP operation is logged under.
+/// Whether `error` means the server is down: an operation timed out, the
+/// server could not be reached, or its host did not resolve. A policy refusal
+/// or an answered failure is not.
+fn unavailable(error: &eyre::Report) -> Option<Unavailable> {
+    match error.downcast_ref::<McpOpError>() {
+        Some(McpOpError::TimedOut { .. }) => Some(Unavailable::TimedOut),
+        Some(McpOpError::Unreachable { .. }) => Some(Unavailable::Unreachable),
+        Some(McpOpError::Failed { .. }) => None,
+        None => error
+            .downcast_ref::<OutboundError>()
+            .filter(|e| e.is_unreachable())
+            .map(|_| Unavailable::Unreachable),
+    }
+}
+
+/// The `outcome` a failed MCP operation is logged and counted under.
 fn outcome_of(error: &eyre::Report) -> &'static str {
-    if timed_out(error) {
-        "timed_out"
-    } else {
-        "failed"
+    match unavailable(error) {
+        Some(Unavailable::TimedOut) => "timed_out",
+        Some(Unavailable::Unreachable) => "unreachable",
+        None => "failed",
     }
 }
 
@@ -216,8 +238,9 @@ pub struct McpToolset {
     catalogue: Vec<String>,
     /// Whether this server being unavailable fails startup and the turn.
     required: bool,
-    /// How long a server that is not required is skipped after a timed-out
-    /// startup discovery or turn start; zero never skips.
+    /// How long a server that is not required is skipped after its startup
+    /// discovery or turn start found it unavailable (timed out or
+    /// unreachable); zero never skips.
     unavailable_skip: Duration,
     /// Deadline on every turn-start operation.
     handshake_timeout: Duration,
@@ -445,7 +468,7 @@ impl McpToolset {
     }
 
     /// Whether this server sits out the turn: only a server that is not
-    /// required, and only inside the window after a timeout.
+    /// required, and only inside the window after it was found unavailable.
     fn in_skip_window(&self) -> bool {
         !self.required
             && self
@@ -455,9 +478,9 @@ impl McpToolset {
                 .is_some_and(|until| Instant::now() < until)
     }
 
-    /// Start the skip window after a timed-out startup discovery or turn
-    /// start.
-    fn note_timeout(&self) {
+    /// Start the skip window after a startup discovery or turn start found
+    /// the server unavailable.
+    fn note_unavailable(&self) {
         if self.required || self.unavailable_skip.is_zero() {
             return;
         }
@@ -696,8 +719,9 @@ struct BackgroundDiscovery {
 
 impl BackgroundDiscovery {
     /// Discover `server` in the background. The outcome is metered by
-    /// [`McpToolset::discover_at_startup`] and logged here; a timeout opens
-    /// the server's skip window, so the first turns do not wait on it again.
+    /// [`McpToolset::discover_at_startup`] and logged here; a timeout or an
+    /// unreachable server opens the server's skip window, so the first turns
+    /// do not wait on it again.
     fn spawn(&self, server: McpToolset) {
         let cancel = self.cancel.clone();
         self.tasks.spawn(async move {
@@ -715,8 +739,8 @@ impl BackgroundDiscovery {
                     "MCP server discovered"
                 ),
                 Some(Err(e)) => {
-                    if timed_out(&e) {
-                        server.note_timeout();
+                    if unavailable(&e).is_some() {
+                        server.note_unavailable();
                     }
                     tracing::warn!(
                         agent = server.scope.agent(),
@@ -857,7 +881,7 @@ impl McpCatalogue {
                 server = %s.id,
                 phase = "turn_start",
                 outcome = "skipped",
-                "MCP server skipped after a timeout"
+                "MCP server skipped inside its skip window"
             )
         });
         let auth = TurnAuth::resolve(
@@ -881,8 +905,8 @@ impl McpCatalogue {
                     tools.into_iter().for_each(|tool| registry.register(tool));
                 }
                 Err(e) => {
-                    if timed_out(&e) {
-                        server.note_timeout();
+                    if unavailable(&e).is_some() {
+                        server.note_unavailable();
                     }
                     tracing::warn!(
                         agent = self.scope.agent(),
@@ -1057,8 +1081,9 @@ impl EdgeMcpTool {
     }
 }
 
-/// How a call's result counts: a tool-level failure is the server's answer,
-/// anything that kept an answer from arriving is the transport's.
+/// How a call's result counts: a tool-level failure is the server's answer; an
+/// unreachable server, a transport failure and a timeout each kept an answer
+/// from arriving.
 fn call_outcome(
     result: &Result<std::result::Result<serde_json::Value, McpError>, tokio::time::error::Elapsed>,
 ) -> CallOutcome {
@@ -1070,6 +1095,7 @@ fn call_outcome(
         }
         Ok(Ok(_)) => CallOutcome::Ok,
         Ok(Err(McpError::ServerError { .. })) => CallOutcome::ToolError,
+        Ok(Err(error)) if error.is_unreachable() => CallOutcome::Unreachable,
         Ok(Err(_)) => CallOutcome::TransportError,
         Err(_) => CallOutcome::Timeout,
     }
@@ -1124,7 +1150,12 @@ impl Tool for EdgeMcpTool {
                 ))
             }
             Ok(Err(error)) => {
-                tracing::warn!(server = %self.server, tool = %self.name, phase = "call", outcome = "failed", error = %error, "edge MCP tool call failed");
+                let outcome = if error.is_unreachable() {
+                    "unreachable"
+                } else {
+                    "failed"
+                };
+                tracing::warn!(server = %self.server, tool = %self.name, phase = "call", outcome, error = %error, "edge MCP tool call failed");
                 Ok(ToolResult::failure(
                     "the tool call did not succeed",
                     elapsed(),
@@ -1239,6 +1270,26 @@ pub(crate) mod tests {
         }
     }
 
+    /// A loopback URL nothing listens on: the port was bound and released.
+    fn closed_port_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}/mcp")
+    }
+
+    /// `server` reached under `Public` at `url`, as if its host had changed
+    /// since the build.
+    fn under_public(catalogue: &McpCatalogue, server: usize, url: &str) -> McpCatalogue {
+        let mut servers = catalogue.servers().to_vec();
+        servers[server].policy = OutboundPolicy::Public;
+        servers[server].endpoint = Url::parse(url).unwrap();
+        McpCatalogue {
+            servers,
+            ..catalogue.clone()
+        }
+    }
+
     #[test]
     fn cached_defs_age_decides_refresh() {
         let fresh = CachedDefs::now(Arc::new(Vec::new()));
@@ -1341,7 +1392,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn deadline_bounds_a_stalled_op() {
-        let stalled = std::future::pending::<Result<(), String>>();
+        let stalled = std::future::pending::<Result<(), McpError>>();
         let err = deadline("initialize", Duration::from_millis(20), stalled)
             .await
             .unwrap_err();
@@ -1354,8 +1405,9 @@ pub(crate) mod tests {
             }
         ));
         let report: eyre::Report = err.into();
-        assert!(
-            timed_out(&report),
+        assert_eq!(
+            unavailable(&report),
+            Some(Unavailable::TimedOut),
             "a timeout survives conversion to a report"
         );
         assert_eq!(outcome_of(&report), "timed_out");
@@ -1364,18 +1416,112 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn deadline_passes_success_and_labels_errors() {
         assert_eq!(
-            deadline("x", Duration::from_secs(5), async { Ok::<_, String>(7) })
+            deadline("x", Duration::from_secs(5), async { Ok::<_, McpError>(7) })
                 .await
                 .unwrap(),
             7
         );
-        let err = deadline("tools/list", Duration::from_secs(5), async {
-            Err::<(), _>("boom".to_string())
+        let answered = [
+            (
+                McpError::Transport("boom".into()),
+                "MCP tools/list failed: transport error: boom",
+            ),
+            (
+                McpError::ServerError {
+                    code: -32000,
+                    message: "no such tool".into(),
+                    data: None,
+                },
+                "MCP tools/list failed: server error (code -32000): no such tool",
+            ),
+        ];
+        for (error, text) in answered {
+            let err = deadline("tools/list", Duration::from_secs(5), async {
+                Err::<(), _>(error)
+            })
+            .await
+            .unwrap_err();
+            assert!(matches!(err, McpOpError::Failed { .. }), "{err}");
+            assert_eq!(err.to_string(), text);
+            let report: eyre::Report = err.into();
+            assert_eq!(outcome_of(&report), "failed");
+            assert_eq!(
+                unavailable(&report),
+                None,
+                "an answer never opens the window"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_tells_an_unreachable_server_from_a_failure() {
+        let err = deadline("initialize", Duration::from_secs(5), async {
+            Err::<(), _>(McpError::Unreachable("connection refused".into()))
         })
         .await
         .unwrap_err();
-        assert_eq!(err.to_string(), "MCP tools/list failed: boom");
-        assert_eq!(outcome_of(&err.into()), "failed");
+        assert!(
+            matches!(
+                err,
+                McpOpError::Unreachable {
+                    op: "initialize",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "MCP initialize failed: server unreachable: connection refused"
+        );
+        let report: eyre::Report = err.into();
+        assert_eq!(outcome_of(&report), "unreachable");
+        assert_eq!(unavailable(&report), Some(Unavailable::Unreachable));
+    }
+
+    /// The report shapes that reach the call sites: an error wrapped as
+    /// `client_for` wraps a refusal, and again as `discover_at_startup` does.
+    #[test]
+    fn an_unresolvable_host_is_unavailable_and_a_refusal_is_not() {
+        fn shapes<E>(error: impl Fn() -> E) -> [eyre::Report; 2]
+        where
+            E: std::error::Error + Send + Sync + 'static,
+        {
+            let refused =
+                || Err::<(), _>(error()).wrap_err("refusing MCP url https://docs.example.com/mcp");
+            [
+                refused().unwrap_err(),
+                refused()
+                    .wrap_err("MCP tool discovery at startup (server docs)")
+                    .unwrap_err(),
+            ]
+        }
+        let assert_shapes = |reports: [eyre::Report; 2], expected: Option<Unavailable>, outcome| {
+            reports.iter().for_each(|report| {
+                assert_eq!(unavailable(report), expected, "{report:#}");
+                assert_eq!(outcome_of(report), outcome, "{report:#}");
+            })
+        };
+        assert_shapes(
+            shapes(|| OutboundError::Unresolvable("docs.example.com".into())),
+            Some(Unavailable::Unreachable),
+            "unreachable",
+        );
+        [
+            OutboundError::PrivateAddress("10.0.0.1".parse().unwrap()),
+            OutboundError::NotHttps,
+            OutboundError::NoHost,
+        ]
+        .into_iter()
+        .for_each(|refusal| assert_shapes(shapes(|| refusal.clone()), None, "failed"));
+        assert_shapes(
+            shapes(|| McpOpError::TimedOut {
+                op: "initialize",
+                secs: 30,
+            }),
+            Some(Unavailable::TimedOut),
+            "timed_out",
+        );
     }
 
     /// Match a POST whose JSON-RPC body has `method == expected`.
@@ -1951,6 +2097,142 @@ pub(crate) mod tests {
         );
     }
 
+    /// An optional server that refuses connections is found unavailable at
+    /// once, on the startup and the lazy path alike, and sits out its window
+    /// without a turn waiting on the handshake deadline.
+    #[test]
+    fn an_unreachable_optional_server_sits_out_its_window() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let primary = mock_mcp(&["harbor.list_orders"]).await;
+                let catalogue = build(&with_optional_docs(&primary.uri(), &closed_port_url()))
+                    .await
+                    .unwrap();
+                catalogue.settled().await;
+                assert!(catalogue.servers()[1].in_skip_window());
+                let registry = catalogue.registry_for(&customer()).await.unwrap();
+                assert!(registry.has("harbor.list_orders") && !registry.has("docs.search"));
+
+                let mut settings = embed(&primary.uri(), None);
+                settings.allowed_tools = vec!["harbor.*".into()];
+                settings.mcp_servers =
+                    vec![extra("wiki", &closed_port_url(), Some("wiki"), &["wiki.*"])];
+                let lazy = build(&settings).await.unwrap();
+                let turn = Instant::now();
+                let registry = lazy.registry_for(&customer()).await.unwrap();
+                assert!(
+                    turn.elapsed() < Duration::from_secs(5),
+                    "{:?}",
+                    turn.elapsed()
+                );
+                assert!(registry.has("harbor.list_orders") && registry.len() == 1);
+                assert!(lazy.servers()[1].in_skip_window());
+
+                lazy.servers()[1].force_skip_expired();
+                lazy.registry_for(&customer()).await.unwrap();
+                assert!(
+                    lazy.servers()[1].in_skip_window(),
+                    "attempted again once the window ends"
+                );
+            })
+        });
+        let recorded = crate::metrics::tests::recorded(&snapshotter);
+        let count = |key: &str| recorded.get(key).copied().unwrap_or(0);
+        for (key, expected) in [
+            ("edge_mcp_discovery_total{agent=acme-help,outcome=unreachable,phase=startup,server=docs,tenant=acme}", 1),
+            ("edge_mcp_skip_window_entered_total{agent=acme-help,server=docs,tenant=acme}", 1),
+            ("edge_mcp_server_skipped_total{agent=acme-help,server=docs,tenant=acme}", 1),
+            ("edge_mcp_discovery_total{agent=acme-help,outcome=unreachable,phase=lazy,server=wiki,tenant=acme}", 2),
+            ("edge_mcp_skip_window_entered_total{agent=acme-help,server=wiki,tenant=acme}", 2),
+            ("edge_mcp_server_skipped_total{agent=acme-help,server=wiki,tenant=acme}", 0),
+        ] {
+            assert_eq!(count(key), expected, "{key} in {recorded:?}");
+        }
+    }
+
+    /// Under `Public` a host that no longer resolves sits out its window,
+    /// while one that now resolves inward is refused again every turn; neither
+    /// is dialled. Relies on `.invalid` resolving to nothing (RFC 6761); the
+    /// classification itself is pinned without DNS above.
+    #[tokio::test]
+    async fn under_public_an_unresolvable_host_sits_out_and_a_refused_address_does_not() {
+        let primary = mock_mcp(&["harbor.list_orders"]).await;
+        let docs = mock_mcp(&["search"]).await;
+        let wiki = mock_mcp(&["page"]).await;
+        let mut settings = embed(&primary.uri(), None);
+        settings.allowed_tools = vec!["harbor.*".into()];
+        settings.mcp_servers = vec![
+            extra("docs", &docs.uri(), Some("docs"), &["docs.*"]),
+            extra("wiki", &wiki.uri(), Some("wiki"), &["wiki.*"]),
+        ];
+        let built = build(&settings).await.unwrap();
+        let catalogue = under_public(
+            &under_public(&built, 1, "https://docs.unresolvable.invalid/mcp"),
+            2,
+            "https://127.0.0.1/mcp",
+        );
+
+        let first = catalogue.registry_for(&customer()).await.unwrap();
+        assert!(first.has("harbor.list_orders") && first.len() == 1);
+        assert!(catalogue.servers()[1].in_skip_window());
+        assert!(!catalogue.servers()[2].in_skip_window());
+
+        catalogue.registry_for(&customer()).await.unwrap();
+        assert!(!catalogue.servers()[2].in_skip_window());
+        assert_eq!((requests(&docs).await, requests(&wiki).await), (0, 0));
+    }
+
+    /// A required server that refuses connections fails the turn, quickly,
+    /// and is attempted again on the next; with a startup credential it fails
+    /// the build. An optional one with a zero window never sits out.
+    #[tokio::test]
+    async fn an_unreachable_required_server_is_never_skipped() {
+        let catalogue = build(&embed(&closed_port_url(), None)).await.unwrap();
+        for _ in 0..2 {
+            let turn = Instant::now();
+            let err = catalogue
+                .registry_for(&customer())
+                .await
+                .err()
+                .expect("the turn fails closed");
+            assert!(
+                err.to_string().contains("required MCP server default"),
+                "{err}"
+            );
+            assert!(
+                turn.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                turn.elapsed()
+            );
+            assert!(!catalogue.servers()[0].in_skip_window());
+        }
+
+        let err = build(&embed(&closed_port_url(), Some("svc-cred")))
+            .await
+            .err()
+            .expect("the build fails closed");
+        assert!(
+            format!("{err:#}").contains("MCP tool discovery at startup"),
+            "{err:#}"
+        );
+
+        let primary = mock_mcp(&["harbor.list_orders"]).await;
+        let mut settings = embed(&primary.uri(), None);
+        settings.allowed_tools = vec!["harbor.*".into()];
+        let mut docs = extra("docs", &closed_port_url(), Some("docs"), &["docs.*"]);
+        docs.connection.unavailable_skip_secs = Some(0);
+        settings.mcp_servers = vec![docs];
+        let catalogue = build(&settings).await.unwrap();
+        catalogue.registry_for(&customer()).await.unwrap();
+        assert!(!catalogue.servers()[1].in_skip_window());
+    }
+
     #[tokio::test]
     async fn each_server_refreshes_its_own_cache() {
         let primary = mock_mcp(&["harbor.list_orders"]).await;
@@ -2256,6 +2538,10 @@ pub(crate) mod tests {
         assert_eq!(
             call_outcome(&Ok(Err(McpError::Transport("refused".into())))),
             CallOutcome::TransportError
+        );
+        assert_eq!(
+            call_outcome(&Ok(Err(McpError::Unreachable("refused".into())))),
+            CallOutcome::Unreachable
         );
         assert_eq!(call_outcome(&Err(timed_out)), CallOutcome::Timeout);
     }

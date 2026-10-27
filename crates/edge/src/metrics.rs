@@ -206,7 +206,10 @@ pub(crate) enum CallOutcome {
     /// The server answered with a tool-level failure (`isError`, or a
     /// JSON-RPC error).
     ToolError,
-    /// The call did not get an answer: connection, auth, rate limit, body.
+    /// The server could not be reached; no answer arrived.
+    Unreachable,
+    /// The call reached the server but got no usable answer: auth, rate
+    /// limit, status, body.
     TransportError,
     Timeout,
 }
@@ -216,6 +219,7 @@ impl CallOutcome {
         match self {
             Self::Ok => "ok",
             Self::ToolError => "tool_error",
+            Self::Unreachable => "unreachable",
             Self::TransportError => "transport_error",
             Self::Timeout => "timeout",
         }
@@ -400,6 +404,13 @@ pub(crate) mod tests {
                 CallOutcome::ToolError,
                 Duration::from_millis(5),
             );
+            tool_call(
+                &scope,
+                "docs",
+                "docs.fetch",
+                CallOutcome::Unreachable,
+                Duration::from_millis(5),
+            );
             server_skipped(&scope, "docs");
             skip_window_entered(&scope, "docs");
             token_exchange(&scope, None, "ok", Duration::from_millis(5));
@@ -412,6 +423,7 @@ pub(crate) mod tests {
             "edge_mcp_discovery_duration_seconds{agent=acme-help,phase=startup,server=docs,tenant=acme}",
             "edge_mcp_tool_calls_total{agent=acme-help,outcome=tool_error,server=docs,tenant=acme,tool=docs.search}",
             "edge_mcp_tool_call_duration_seconds{agent=acme-help,server=docs,tenant=acme,tool=docs.search}",
+            "edge_mcp_tool_calls_total{agent=acme-help,outcome=unreachable,server=docs,tenant=acme,tool=docs.fetch}",
             "edge_mcp_server_skipped_total{agent=acme-help,server=docs,tenant=acme}",
             "edge_mcp_skip_window_entered_total{agent=acme-help,server=docs,tenant=acme}",
             "edge_mcp_token_exchanges_total{agent=acme-help,audience=none,outcome=ok,tenant=acme}",
