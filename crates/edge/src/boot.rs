@@ -297,7 +297,9 @@ impl SharedInfra {
                 vellev.query_prefix.as_deref(),
             )
             .with_score_map(vellev.knots());
-        ensure_collection("edge-vellev", vellev.connect_budget_secs, store).await
+        ensure_collection("edge-vellev", vellev.connect_budget_secs, store)
+            .await
+            .map(|store| store as Arc<dyn MemoryStore>)
     }
 
     /// Create `tenant`'s vellev tenant and issue it a key, returning the
@@ -511,7 +513,7 @@ pub async fn connect(config: &EdgeConfig) -> Result<SharedInfra> {
     };
     let (sessions_pool, rls_enforced) = connect_postgres(config).await?;
     let tenants_pool = TenantPool::new(sessions_pool.clone());
-    let memory = connect_memory(config).await?;
+    let memory = connect_memory(config, &sessions_pool).await?;
     if let Some(cfg) = &config.artifacts {
         workforce_common::private_fs::ensure_private_dir(Path::new(&cfg.root))
             .wrap_err("initialising the artifact root")?;
@@ -689,12 +691,28 @@ async fn connect_postgres(config: &EdgeConfig) -> Result<(PostgresPool, bool)> {
 
 /// Dial whichever vector store the config names, until its collection is
 /// ensured or the budget runs out.
-async fn connect_memory(config: &EdgeConfig) -> Result<Arc<dyn MemoryStore>> {
+/// The install's own store. A `[weaviate] previous_collection` is held
+/// beside the edge's class while memories move into it (see
+/// [`crate::previous`]); `pool` keeps the move to one replica at a time.
+async fn connect_memory(config: &EdgeConfig, pool: &PostgresPool) -> Result<Arc<dyn MemoryStore>> {
     match config.memory_backend()? {
         MemoryBackend::Weaviate(weaviate) => {
-            let store = WeaviateStore::new(weaviate.url.clone(), weaviate.api_key.as_deref())
-                .in_collection(weaviate.own_collection()?);
-            ensure_collection("edge-weaviate", weaviate.connect_budget_secs, store).await
+            let store = |class: &str| {
+                WeaviateStore::new(weaviate.url.clone(), weaviate.api_key.as_deref())
+                    .in_collection(class)
+            };
+            let current = ensure_collection(
+                "edge-weaviate",
+                weaviate.connect_budget_secs,
+                store(weaviate.own_collection()?),
+            )
+            .await?;
+            match weaviate.previous_collection()? {
+                Some(previous) => {
+                    crate::previous::open(current, store(previous), pool.clone()).await
+                }
+                None => Ok(current),
+            }
         }
         MemoryBackend::Vellev(vellev) => {
             let store = VellevStore::new(
@@ -709,7 +727,9 @@ async fn connect_memory(config: &EdgeConfig) -> Result<Arc<dyn MemoryStore>> {
                 vellev.query_prefix.as_deref(),
             )
             .with_score_map(vellev.knots());
-            ensure_collection("edge-vellev", vellev.connect_budget_secs, store).await
+            ensure_collection("edge-vellev", vellev.connect_budget_secs, store)
+                .await
+                .map(|store| store as Arc<dyn MemoryStore>)
         }
     }
 }
@@ -718,7 +738,7 @@ async fn ensure_collection<S: MemoryAdmin + MemoryStore + 'static>(
     name: &'static str,
     budget_secs: u64,
     store: S,
-) -> Result<Arc<dyn MemoryStore>> {
+) -> Result<Arc<S>> {
     let store = Arc::new(store);
     let probe = Arc::clone(&store);
     connect_with_retry(

@@ -34,6 +34,12 @@ async fn main() -> Result<()> {
         return workforce_edge::migrate::run_cli(&argv[2..]).await;
     }
 
+    // `workforce-edge memory …` — the class the edge kept its memories in
+    // before it named its own ([weaviate] previous_collection).
+    if argv.get(1).map(String::as_str) == Some(workforce_edge::previous::COMMAND) {
+        return workforce_edge::previous::run_cli(&argv[2..]).await;
+    }
+
     let config_path = config_path();
     let config = EdgeConfig::load(&config_path)
         .wrap_err_with(|| format!("loading edge config from {}", config_path.display()))?;
