@@ -848,19 +848,19 @@ impl McpCatalogue {
         policy: OutboundPolicy,
         exchanger: Option<Arc<TokenExchanger>>,
     ) -> Result<Self> {
-        let (servers, excluded) = Self::prepare(&scope, embed, policy, exchanger.as_deref())?;
-        Self::start(scope, servers, excluded, exchanger).await
+        let (servers, unusable) = Self::prepare(&scope, embed, policy, exchanger.as_deref())?;
+        Self::start(scope, servers, unusable, exchanger).await
     }
 
     /// Check the agent's servers and prepare each one; nothing is dialled. A
     /// required server whose URL cannot be used fails the build; any other is
-    /// excluded, and named and counted only once the build is known to go on.
-    fn prepare(
+    /// returned with why, for [`Self::start`] to exclude.
+    fn prepare<'a>(
         scope: &AgentScope,
-        embed: &EmbedSettings,
+        embed: &'a EmbedSettings,
         policy: OutboundPolicy,
         exchanger: Option<&TokenExchanger>,
-    ) -> Result<(Vec<McpToolset>, Vec<Arc<str>>)> {
+    ) -> Result<(Vec<McpToolset>, Vec<Unusable<'a>>)> {
         embed.check_mcp_servers().map_err(|e| {
             metrics::config_refused(e.reason);
             eyre::Report::new(e)
@@ -879,35 +879,29 @@ impl McpCatalogue {
                 });
         }
         let install_audience = exchanger.and_then(TokenExchanger::audience);
-        let prepared = specs
-            .iter()
-            .map(
-                |spec| match McpToolset::prepare(scope, spec, policy, install_audience) {
-                    Err(e) if spec.required => Err(eyre!("{}.url {e}", spec.field())),
-                    result => Ok((spec, result)),
-                },
-            )
-            .collect::<Result<Vec<_>>>()?;
-        Ok(prepared.into_iter().fold(
+        specs.into_iter().try_fold(
             (Vec::new(), Vec::new()),
-            |(mut servers, mut excluded), (spec, result)| {
-                match result {
+            |(mut servers, mut unusable), spec| {
+                match McpToolset::prepare(scope, &spec, policy, install_audience) {
                     Ok(server) => servers.push(server),
-                    Err(e) => excluded.push(exclude(scope, spec, &e)),
+                    Err(e) if spec.required => return Err(eyre!("{}.url {e}", spec.field())),
+                    Err(e) => unusable.push((spec, e)),
                 }
-                (servers, excluded)
+                Ok((servers, unusable))
             },
-        ))
+        )
     }
 
     /// Discover at startup. A required server's discovery is awaited and its
     /// failure fails the build (fail-closed). Every other server with a
     /// discovery credential is discovered in the background: its tools appear
-    /// once found, and a turn before then discovers it lazily.
+    /// once found, and a turn before then discovers it lazily. Each `unusable`
+    /// server is excluded once the build is known to go on, so a build that
+    /// fails, and is retried, names and counts none of them.
     async fn start(
         scope: AgentScope,
         servers: Vec<McpToolset>,
-        excluded: Vec<Arc<str>>,
+        unusable: Vec<Unusable<'_>>,
         exchanger: Option<Arc<TokenExchanger>>,
     ) -> Result<Self> {
         let background = Arc::new(BackgroundDiscovery::default());
@@ -923,6 +917,10 @@ impl McpCatalogue {
                 .map(McpToolset::discover_at_startup),
         )
         .await?;
+        let excluded = unusable
+            .iter()
+            .map(|(spec, e)| exclude(&scope, spec, e))
+            .collect();
         Ok(Self {
             scope,
             servers,
@@ -1064,6 +1062,9 @@ impl McpCatalogue {
         &self.servers
     }
 }
+
+/// A server that is not required, with why its URL cannot be used.
+type Unusable<'a> = (McpServerSpec<'a>, McpUrlError);
 
 /// Leave `spec` out of the build: log it once, count it, and name it.
 fn exclude(scope: &AgentScope, spec: &McpServerSpec<'_>, e: &McpUrlError) -> Arc<str> {
@@ -1339,13 +1340,13 @@ pub(crate) mod tests {
 
     /// [`build`] with every server's turn-start operations bounded by `limit`.
     async fn build_with_timeout(embed: &EmbedSettings, limit: Duration) -> Result<McpCatalogue> {
-        let (servers, excluded) =
+        let (servers, unusable) =
             McpCatalogue::prepare(&scope(), embed, OutboundPolicy::Private, None)?;
         let servers = servers
             .into_iter()
             .map(|s| s.with_handshake_timeout(limit))
             .collect();
-        McpCatalogue::start(scope(), servers, excluded, None).await
+        McpCatalogue::start(scope(), servers, unusable, None).await
     }
 
     /// A primary with `harbor.*` and a startup credential, plus `docs`: an
@@ -1633,7 +1634,8 @@ pub(crate) mod tests {
 
     /// A required server whose URL cannot be used fails the build by field,
     /// without the URL, and excludes nothing: not even an optional server
-    /// prepared before it, whose build never served.
+    /// prepared before it, nor one beside a required server down at startup,
+    /// whose build never served.
     #[test]
     fn a_required_server_whose_url_cannot_be_used_fails_the_build() {
         let (_, recorded) = recording(|| async {
@@ -1665,6 +1667,15 @@ pub(crate) mod tests {
                 err.to_string()
                     .contains("mcp_servers[wiki].url is not a URL"),
                 "{err}"
+            );
+
+            let mut settings = embed(&closed_port_url(), Some("svc-cred"));
+            settings.allowed_tools = vec!["harbor.*".into()];
+            settings.mcp_servers = vec![extra("docs", "", Some("docs"), &["docs.*"])];
+            let err = build(&settings).await.err().expect("the primary is down");
+            assert!(
+                format!("{err:#}").contains("MCP tool discovery at startup"),
+                "{err:#}"
             );
         });
         assert_eq!(excluded_counts(&recorded), 0, "{recorded:?}");
