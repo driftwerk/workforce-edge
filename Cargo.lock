@@ -182,7 +182,7 @@ dependencies = [
  "once_cell",
  "pin-project",
  "portable-atomic",
- "rand 0.8.5",
+ "rand 0.8.6",
  "regex",
  "ring",
  "rustls-native-certs 0.7.3",
@@ -667,6 +667,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base16ct"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
+
+[[package]]
 name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -936,9 +942,9 @@ dependencies = [
  "codepage",
  "encoding_rs",
  "log",
- "quick-xml",
+ "quick-xml 0.31.0",
  "serde",
- "zip",
+ "zip 2.4.2",
 ]
 
 [[package]]
@@ -1319,6 +1325,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
+name = "crypto-bigint"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0dc92fb57ca44df6db8059111ab3af99a63d5d0f8375d9972e319a379c6bab76"
+dependencies = [
+ "generic-array",
+ "rand_core 0.6.4",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1390,6 +1408,7 @@ dependencies = [
  "fiat-crypto",
  "rustc_version",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1545,6 +1564,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
+ "const-oid 0.9.6",
  "crypto-common 0.1.7",
  "subtle",
 ]
@@ -1624,11 +1644,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ecdsa"
+version = "0.16.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee27f32b5c5292967d2d4a9d7f1e0b0aed2c15daded5a60300e4abb9d8020bca"
+dependencies = [
+ "der",
+ "digest 0.10.7",
+ "elliptic-curve",
+ "rfc6979",
+ "signature",
+ "spki",
+]
+
+[[package]]
 name = "ed25519"
 version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
+ "pkcs8",
  "signature",
 ]
 
@@ -1640,9 +1675,11 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "serde",
  "sha2 0.10.9",
  "signature",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1652,6 +1689,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "elliptic-curve"
+version = "0.13.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e6043086bf7973472e0c7dff2142ea0b680d30e18d9cc40f267efbf222bd47"
+dependencies = [
+ "base16ct",
+ "crypto-bigint",
+ "digest 0.10.7",
+ "ff",
+ "generic-array",
+ "group",
+ "hkdf",
+ "pem-rfc7468",
+ "pkcs8",
+ "rand_core 0.6.4",
+ "sec1",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1776,6 +1834,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "ff"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0b50bfb653653f9ca9095b427bed08ab8d75a137839d9ad64eb11810d5b6393"
+dependencies = [
+ "rand_core 0.6.4",
+ "subtle",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1812,6 +1880,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -2088,6 +2157,7 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
+ "zeroize",
 ]
 
 [[package]]
@@ -2124,11 +2194,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.0",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2164,6 +2236,17 @@ dependencies = [
  "log",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "group"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0f9ef7462f7c099f518d754361858f86d8a07af53ba9af0fe635bbccb151a63"
+dependencies = [
+ "ff",
+ "rand_core 0.6.4",
+ "subtle",
 ]
 
 [[package]]
@@ -2897,17 +2980,26 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "9.3.1"
+version = "10.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
+checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
 dependencies = [
  "base64 0.22.1",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "hmac 0.12.1",
  "js-sys",
+ "p256",
+ "p384",
  "pem",
- "ring",
+ "rand 0.8.6",
+ "rsa",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "signature",
  "simple_asn1",
+ "zeroize",
 ]
 
 [[package]]
@@ -2924,6 +3016,9 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+dependencies = [
+ "spin",
+]
 
 [[package]]
 name = "leb128fmt"
@@ -2933,9 +3028,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
-version = "0.2.184"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libloading"
@@ -3272,7 +3367,7 @@ dependencies = [
  "pem",
  "percent-encoding",
  "pin-project",
- "rand 0.8.5",
+ "rand 0.8.6",
  "rustls 0.23.37",
  "rustls-pemfile",
  "serde",
@@ -3311,7 +3406,7 @@ dependencies = [
  "mysql-common-derive",
  "num-bigint",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.8.6",
  "regex",
  "rust_decimal",
  "saturating",
@@ -3351,6 +3446,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "nkeys"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3361,7 +3468,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
  "log",
- "rand 0.8.5",
+ "rand 0.8.6",
  "signatory",
 ]
 
@@ -3410,7 +3517,7 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc895af95856f929163a0aa20c26a78d26bfdc839f51b9d5aa7a5b79e52b7e83"
 dependencies = [
- "rand 0.8.5",
+ "rand 0.8.6",
 ]
 
 [[package]]
@@ -3435,6 +3542,22 @@ checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
 dependencies = [
  "num-integer",
  "num-traits",
+]
+
+[[package]]
+name = "num-bigint-dig"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e661dda6640fad38e827a6d4a310ff4763082116fe217f279885c97f511bb0b7"
+dependencies = [
+ "lazy_static",
+ "libm",
+ "num-integer",
+ "num-iter",
+ "num-traits",
+ "rand 0.8.6",
+ "smallvec",
+ "zeroize",
 ]
 
 [[package]]
@@ -3496,6 +3619,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+ "libm",
 ]
 
 [[package]]
@@ -3633,6 +3757,30 @@ name = "owo-colors"
 version = "4.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d211803b9b6b570f68772237e415a029d5a50c65d382910b879fb19d3271f94d"
+
+[[package]]
+name = "p256"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primeorder",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "p384"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe42f1670a52a47d448f14b6a5c61dd78fce51856e68edaa38f7ae3a46b8d6b6"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primeorder",
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "parking"
@@ -3810,7 +3958,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
 dependencies = [
  "phf_shared 0.11.3",
- "rand 0.8.5",
+ "rand 0.8.6",
 ]
 
 [[package]]
@@ -3871,6 +4019,17 @@ name = "pin-utils"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
+
+[[package]]
+name = "pkcs1"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8ffb9f10fa047879315e6625af03c164b16962a5368d724ed16323b68ace47f"
+dependencies = [
+ "der",
+ "pkcs8",
+ "spki",
+]
 
 [[package]]
 name = "pkcs8"
@@ -4056,6 +4215,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "primeorder"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "353e1ca18966c16d9deb1c69278edbc5f194139612772bd9537af60ac231e1e6"
+dependencies = [
+ "elliptic-curve",
+]
+
+[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4137,6 +4305,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1004a344b30a54e2ee58d66a71b32d2db2feb0a31f9a2d302bf0536f15de2a33"
 dependencies = [
  "encoding_rs",
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
  "memchr",
 ]
 
@@ -4225,9 +4402,9 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 
 [[package]]
 name = "rand"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404"
+checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
 dependencies = [
  "libc",
  "rand_chacha 0.3.1",
@@ -4659,6 +4836,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rfc6979"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dd2a808d456c4a54e300a23e9f5a67e122c3024119acbfd73e3bf664491cb2"
+dependencies = [
+ "hmac 0.12.1",
+ "subtle",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4723,6 +4910,26 @@ dependencies = [
  "serde_derive",
  "typeid",
  "unicode-ident",
+]
+
+[[package]]
+name = "rsa"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"
+dependencies = [
+ "const-oid 0.9.6",
+ "digest 0.10.7",
+ "num-bigint-dig",
+ "num-integer",
+ "num-traits",
+ "pkcs1",
+ "pkcs8",
+ "rand_core 0.6.4",
+ "signature",
+ "spki",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -4794,7 +5001,7 @@ dependencies = [
  "borsh",
  "bytes",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.8.6",
  "rkyv",
  "serde",
  "serde_json",
@@ -4807,7 +5014,7 @@ version = "0.79.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c743cb9f2a4524676020e26ee5f298445a82d882b09956811b1e78ca7e42b440"
 dependencies = [
- "zip",
+ "zip 2.4.2",
 ]
 
 [[package]]
@@ -5033,6 +5240,20 @@ name = "seahash"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
+
+[[package]]
+name = "sec1"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
+dependencies = [
+ "base16ct",
+ "der",
+ "generic-array",
+ "pkcs8",
+ "subtle",
+ "zeroize",
+]
 
 [[package]]
 name = "security-framework"
@@ -5499,7 +5720,7 @@ dependencies = [
  "md-5 0.10.6",
  "memchr",
  "once_cell",
- "rand 0.8.5",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -6026,7 +6247,7 @@ dependencies = [
  "futures-sink",
  "http 1.4.0",
  "httparse",
- "rand 0.8.5",
+ "rand 0.8.6",
  "ring",
  "rustls-native-certs 0.8.3",
  "rustls-pki-types",
@@ -6306,7 +6527,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
  "cfg-if",
- "rand 0.8.5",
+ "rand 0.8.6",
  "static_assertions",
 ]
 
@@ -6318,6 +6539,12 @@ checksum = "fa10c302f5a53b7ad27fd42a3996e23d096ba39b5b8dd6d9e683a05b01bee749"
 dependencies = [
  "pom",
 ]
+
+[[package]]
+name = "typed-path"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
 
 [[package]]
 name = "typeid"
@@ -7352,7 +7579,7 @@ dependencies = [
 [[package]]
 name = "workforce-agent"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -7381,8 +7608,8 @@ dependencies = [
  "parking_lot",
  "pdf-extract",
  "percent-encoding",
- "quick-xml",
- "rand 0.8.5",
+ "quick-xml 0.41.0",
+ "rand 0.8.6",
  "regex",
  "reqwest 0.12.28",
  "rusqlite",
@@ -7413,18 +7640,18 @@ dependencies = [
  "workforce-policy",
  "workforce-sift",
  "x509-cert",
- "zip",
+ "zip 9.1.2",
 ]
 
 [[package]]
 name = "workforce-build-support"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 
 [[package]]
 name = "workforce-common"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7441,7 +7668,7 @@ dependencies = [
  "lru 0.18.5",
  "once_cell",
  "parking_lot",
- "rand 0.8.5",
+ "rand 0.8.6",
  "refinery",
  "regex",
  "rusqlite",
@@ -7465,7 +7692,7 @@ dependencies = [
 [[package]]
 name = "workforce-core"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7481,14 +7708,14 @@ dependencies = [
 [[package]]
 name = "workforce-crypto"
 version = "0.1.0"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "aes",
  "aes-gcm",
  "argon2",
  "hkdf",
  "hmac 0.12.1",
- "rand 0.8.5",
+ "rand 0.8.6",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "uuid",
@@ -7519,7 +7746,7 @@ dependencies = [
  "metrics-util",
  "mime_guess",
  "pdf-extract",
- "quick-xml",
+ "quick-xml 0.41.0",
  "refinery",
  "reqwest 0.12.28",
  "rust-embed",
@@ -7553,13 +7780,13 @@ dependencies = [
  "workforce-playbook",
  "workforce-policy",
  "workforce-postgres",
- "zip",
+ "zip 9.1.2",
 ]
 
 [[package]]
 name = "workforce-lessons"
 version = "0.1.0"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "chrono",
  "eyre",
@@ -7579,7 +7806,7 @@ dependencies = [
 [[package]]
 name = "workforce-mcp-client"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "async-trait",
  "eyre",
@@ -7599,7 +7826,7 @@ dependencies = [
 [[package]]
 name = "workforce-memory"
 version = "0.1.0"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7607,7 +7834,7 @@ dependencies = [
  "futures",
  "once_cell",
  "parking_lot",
- "rand 0.8.5",
+ "rand 0.8.6",
  "regex",
  "reqwest 0.12.28",
  "rusqlite",
@@ -7628,7 +7855,7 @@ dependencies = [
 [[package]]
 name = "workforce-nats"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -7649,13 +7876,13 @@ dependencies = [
 [[package]]
 name = "workforce-pairing"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "async-trait",
  "blake3",
  "chrono",
  "eyre",
- "rand 0.8.5",
+ "rand 0.8.6",
  "rusqlite",
  "serde",
  "serde_json",
@@ -7669,7 +7896,7 @@ dependencies = [
 [[package]]
 name = "workforce-playbook"
 version = "0.1.0"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "eyre",
  "serde",
@@ -7681,7 +7908,7 @@ dependencies = [
 [[package]]
 name = "workforce-policy"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7700,7 +7927,7 @@ dependencies = [
 [[package]]
 name = "workforce-postgres"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7721,7 +7948,7 @@ dependencies = [
 [[package]]
 name = "workforce-sift"
 version = "0.1.0"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "async-trait",
  "futures",
@@ -7733,7 +7960,7 @@ dependencies = [
 [[package]]
 name = "workforce-vellev"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=7ba113b71a7e485bc18d1c6b7006ec793b363a5f#7ba113b71a7e485bc18d1c6b7006ec793b363a5f"
+source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7947,6 +8174,29 @@ dependencies = [
  "thiserror 2.0.18",
  "zopfli",
 ]
+
+[[package]]
+name = "zip"
+version = "9.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec2e3161de27091f18a831d9494e9c53378a34833af5c1dda35ad85849da18d6"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "getrandom 0.4.2",
+ "indexmap",
+ "memchr",
+ "nix",
+ "typed-path",
+ "windows-sys 0.61.2",
+ "zopfli",
+]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"
