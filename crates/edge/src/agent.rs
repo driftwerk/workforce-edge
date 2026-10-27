@@ -718,8 +718,8 @@ pub struct McpSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
     /// How long a server that is not required is skipped after its startup
-    /// discovery or turn start timed out, so a stalled server does not slow
-    /// every turn. `None` ⇒
+    /// discovery or turn start timed out or could not reach it, so a server
+    /// that is down does not slow every turn. `None` ⇒
     /// [`DEFAULT_UNAVAILABLE_SKIP_SECS`]; `0` ⇒ never skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_skip_secs: Option<u64>,
@@ -861,7 +861,7 @@ impl<'a> McpServerSpec<'a> {
         }
     }
 
-    /// How long this server is skipped after a timeout.
+    /// How long this server is skipped once found unavailable.
     pub fn unavailable_skip(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
             self.connection
