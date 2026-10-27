@@ -52,7 +52,7 @@ axum = { version = "0.8", features = ["ws", "multipart"] }
 # Training-file text extraction (uploads). Same versions the hub loaders use.
 pdf-extract = "0.10"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
-quick-xml = "0.31"
+quick-xml = "0.41"
 tower-http = { version = "0.6", features = ["cors"] }
 futures = { workspace = true }
 ipnetwork = "0.20"
