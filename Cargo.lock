@@ -7579,7 +7579,7 @@ dependencies = [
 [[package]]
 name = "workforce-agent"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -7646,12 +7646,12 @@ dependencies = [
 [[package]]
 name = "workforce-build-support"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 
 [[package]]
 name = "workforce-common"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7692,7 +7692,7 @@ dependencies = [
 [[package]]
 name = "workforce-core"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7708,7 +7708,7 @@ dependencies = [
 [[package]]
 name = "workforce-crypto"
 version = "0.1.0"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -7786,7 +7786,7 @@ dependencies = [
 [[package]]
 name = "workforce-lessons"
 version = "0.1.0"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "chrono",
  "eyre",
@@ -7806,7 +7806,7 @@ dependencies = [
 [[package]]
 name = "workforce-mcp-client"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "async-trait",
  "eyre",
@@ -7826,7 +7826,7 @@ dependencies = [
 [[package]]
 name = "workforce-memory"
 version = "0.1.0"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7855,7 +7855,7 @@ dependencies = [
 [[package]]
 name = "workforce-nats"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -7876,7 +7876,7 @@ dependencies = [
 [[package]]
 name = "workforce-pairing"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "async-trait",
  "blake3",
@@ -7896,7 +7896,7 @@ dependencies = [
 [[package]]
 name = "workforce-playbook"
 version = "0.1.0"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "eyre",
  "serde",
@@ -7908,7 +7908,7 @@ dependencies = [
 [[package]]
 name = "workforce-policy"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7927,7 +7927,7 @@ dependencies = [
 [[package]]
 name = "workforce-postgres"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7948,7 +7948,7 @@ dependencies = [
 [[package]]
 name = "workforce-sift"
 version = "0.1.0"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "async-trait",
  "futures",
@@ -7960,7 +7960,7 @@ dependencies = [
 [[package]]
 name = "workforce-vellev"
 version = "0.1.7"
-source = "git+https://github.com/driftwerk/workforce?rev=98c714ca515b799218150bb5aa14fb614943a5c1#98c714ca515b799218150bb5aa14fb614943a5c1"
+source = "git+https://github.com/driftwerk/workforce?rev=2d58b63a8314982d6f0dacbff3555fbd9fa42d79#2d58b63a8314982d6f0dacbff3555fbd9fa42d79"
 dependencies = [
  "async-trait",
  "chrono",

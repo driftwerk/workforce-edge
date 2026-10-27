@@ -14,17 +14,17 @@ repository = "https://github.com/driftwerk/workforce-edge"
 [workspace.dependencies]
 # Core crates from the public Workforce repository, pinned to one revision.
 # To build against a local core checkout, see `.cargo/config.toml`.
-workforce-agent = { git = "https://github.com/driftwerk/workforce", rev = "98c714ca515b799218150bb5aa14fb614943a5c1" }
-workforce-build-support = { git = "https://github.com/driftwerk/workforce", rev = "98c714ca515b799218150bb5aa14fb614943a5c1" }
-workforce-common = { git = "https://github.com/driftwerk/workforce", rev = "98c714ca515b799218150bb5aa14fb614943a5c1" }
-workforce-core = { git = "https://github.com/driftwerk/workforce", rev = "98c714ca515b799218150bb5aa14fb614943a5c1" }
-workforce-crypto = { git = "https://github.com/driftwerk/workforce", rev = "98c714ca515b799218150bb5aa14fb614943a5c1" }
-workforce-lessons = { git = "https://github.com/driftwerk/workforce", rev = "98c714ca515b799218150bb5aa14fb614943a5c1" }
-workforce-mcp-client = { git = "https://github.com/driftwerk/workforce", rev = "98c714ca515b799218150bb5aa14fb614943a5c1" }
-workforce-memory = { git = "https://github.com/driftwerk/workforce", rev = "98c714ca515b799218150bb5aa14fb614943a5c1" }
-workforce-playbook = { git = "https://github.com/driftwerk/workforce", rev = "98c714ca515b799218150bb5aa14fb614943a5c1" }
-workforce-policy = { git = "https://github.com/driftwerk/workforce", rev = "98c714ca515b799218150bb5aa14fb614943a5c1" }
-workforce-postgres = { git = "https://github.com/driftwerk/workforce", rev = "98c714ca515b799218150bb5aa14fb614943a5c1" }
+workforce-agent = { git = "https://github.com/driftwerk/workforce", rev = "2d58b63a8314982d6f0dacbff3555fbd9fa42d79" }
+workforce-build-support = { git = "https://github.com/driftwerk/workforce", rev = "2d58b63a8314982d6f0dacbff3555fbd9fa42d79" }
+workforce-common = { git = "https://github.com/driftwerk/workforce", rev = "2d58b63a8314982d6f0dacbff3555fbd9fa42d79" }
+workforce-core = { git = "https://github.com/driftwerk/workforce", rev = "2d58b63a8314982d6f0dacbff3555fbd9fa42d79" }
+workforce-crypto = { git = "https://github.com/driftwerk/workforce", rev = "2d58b63a8314982d6f0dacbff3555fbd9fa42d79" }
+workforce-lessons = { git = "https://github.com/driftwerk/workforce", rev = "2d58b63a8314982d6f0dacbff3555fbd9fa42d79" }
+workforce-mcp-client = { git = "https://github.com/driftwerk/workforce", rev = "2d58b63a8314982d6f0dacbff3555fbd9fa42d79" }
+workforce-memory = { git = "https://github.com/driftwerk/workforce", rev = "2d58b63a8314982d6f0dacbff3555fbd9fa42d79" }
+workforce-playbook = { git = "https://github.com/driftwerk/workforce", rev = "2d58b63a8314982d6f0dacbff3555fbd9fa42d79" }
+workforce-policy = { git = "https://github.com/driftwerk/workforce", rev = "2d58b63a8314982d6f0dacbff3555fbd9fa42d79" }
+workforce-postgres = { git = "https://github.com/driftwerk/workforce", rev = "2d58b63a8314982d6f0dacbff3555fbd9fa42d79" }
 
 argon2 = "0.5"
 async-trait = "0.1.85"
