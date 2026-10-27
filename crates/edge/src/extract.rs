@@ -94,7 +94,19 @@ fn extract_docx(bytes: &[u8]) -> Result<String, String> {
             Ok(Event::End(e)) if e.name().as_ref() == b"w:t" => in_text = false,
             Ok(Event::End(e)) if e.name().as_ref() == b"w:p" => out.push_str("\n\n"),
             Ok(Event::Text(t)) if in_text => {
-                out.push_str(&t.unescape().unwrap_or_default());
+                out.push_str(&t.decode().unwrap_or_default());
+            }
+            // Entity references (`&amp;`, `&#38;`) arrive as their own events.
+            Ok(Event::GeneralRef(r)) if in_text => {
+                if let Ok(Some(c)) = r.resolve_char_ref() {
+                    out.push(c);
+                } else if let Some(text) = r
+                    .decode()
+                    .ok()
+                    .and_then(|name| quick_xml::escape::resolve_predefined_entity(&name))
+                {
+                    out.push_str(text);
+                }
             }
             Ok(Event::Eof) => break,
             Err(_) => return Err("malformed .docx XML".into()),
@@ -158,7 +170,7 @@ mod tests {
             zip.write_all(
                 br#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
                     <w:p><w:r><w:t>Hello</w:t><w:t xml:space="preserve"> world</w:t></w:r></w:p>
-                    <w:p><w:r><w:t>Second para</w:t></w:r></w:p>
+                    <w:p><w:r><w:t>Second para: fish &amp; chips &#38; peas</w:t></w:r></w:p>
                 </w:body></w:document>"#,
             )
             .unwrap();
@@ -166,6 +178,9 @@ mod tests {
         }
         let text = extract("doc.docx", &buf).unwrap();
         assert!(text.contains("Hello world"), "runs joined: {text:?}");
-        assert!(text.contains("Second para"));
+        assert!(
+            text.contains("Second para: fish & chips & peas"),
+            "entity references resolved: {text:?}"
+        );
     }
 }
