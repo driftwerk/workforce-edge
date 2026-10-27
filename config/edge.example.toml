@@ -122,8 +122,10 @@ url = "https://mcp.harbor.example"
 #   turn. Default true here (the primary server) and false on an additional
 #   server, whose outage only removes its tools for that turn.
 # - unavailable_skip_secs: how long a server that is not required sits out
-#   after its startup discovery or turn start timed out. Default 60; 0 never
-#   skips.
+#   after its startup discovery or turn start timed out or could not reach it
+#   (connection refused, DNS, TLS, connect timeout). A server that answers
+#   with an error, or whose address the outbound policy refuses, is retried
+#   every turn. Default 60; 0 never skips.
 # auth = "exchanged"
 # audience = "harbor-mcp"
 

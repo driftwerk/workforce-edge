@@ -44,8 +44,8 @@ export interface GrantRow {
   tools: string;
 }
 
-/** How long a server that is not required sits out after a timed-out turn
- *  start, when it names no window of its own. */
+/** How long a server that is not required sits out after a turn start that
+ *  timed out or could not reach it, when it names no window of its own. */
 export const DEFAULT_SKIP_SECS = 60;
 
 /** An MCP server's connection as the editor holds it. */

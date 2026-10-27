@@ -66,6 +66,14 @@ impl std::fmt::Display for OutboundError {
 
 impl std::error::Error for OutboundError {}
 
+impl OutboundError {
+    /// Whether the host could not be reached at all, as opposed to the policy
+    /// refusing it.
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Unresolvable(_))
+    }
+}
+
 /// Connect bound on a `Public` client. The total timeout is the caller's; a
 /// connect that stalls on an unreachable address must not eat all of it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -478,6 +486,18 @@ mod tests {
         assert!(redirect_decision(&url("http://93.184.216.34/"), 1).is_err());
         assert!(redirect_decision(&url("https://93.184.216.34/"), MAX_REDIRECTS).is_err());
         assert!(redirect_decision(&url("https://93.184.216.34/"), 1).is_ok());
+    }
+
+    #[test]
+    fn only_an_unresolvable_host_is_unreachable() {
+        assert!(OutboundError::Unresolvable("docs.example.com".into()).is_unreachable());
+        [
+            OutboundError::NotHttps,
+            OutboundError::NoHost,
+            OutboundError::PrivateAddress(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))),
+        ]
+        .iter()
+        .for_each(|refusal| assert!(!refusal.is_unreachable(), "{refusal}"));
     }
 
     #[test]
