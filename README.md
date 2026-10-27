@@ -39,7 +39,11 @@ An agent acts against one primary MCP server (`[agents.embed.mcp]`) and,
 optionally, more servers alongside it (`[[agents.embed.mcp_servers]]`). Each
 server has its own URL, credential, auth mode, token audience, allowlist and
 write tiers. A server that is not `required` being down only removes its tools
-for that turn, and its startup discovery runs in the background, so it never
+for that turn. One that times out or cannot be reached (connection refused,
+DNS, TLS, connect timeout) also sits out the next `unavailable_skip_secs`
+seconds (default 60, 0 never skips). One that answers with an error, or whose
+address the outbound policy refuses, is retried on the next turn. The startup
+discovery of a server that is not `required` runs in the background, so it never
 holds boot or an admin save. Give each server its own token-exchange `audience`, so a token
 minted for one server is not accepted by another. `config/edge.example.toml`
 describes every key. `edge.toml` seeds agents on first boot only, so an
@@ -71,13 +75,13 @@ tool's arguments or a URL.
 
 | Metric | Type | Labels |
 |---|---|---|
-| `edge_mcp_discovery_total` | counter | `tenant`, `agent`, `server`, `phase` (`startup`, `lazy`, `refresh`), `outcome` (`ok`, `failed`, `timed_out`) |
+| `edge_mcp_discovery_total` | counter | `tenant`, `agent`, `server`, `phase` (`startup`, `lazy`, `refresh`), `outcome` (`ok`, `failed`, `timed_out`, `unreachable`) |
 | `edge_mcp_discovery_duration_seconds` | histogram | `tenant`, `agent`, `server`, `phase` |
 | `edge_mcp_tools_cache_total` | counter | `tenant`, `agent`, `server`, `result` (`hit`, `miss`, `stale`) |
-| `edge_mcp_tool_calls_total` | counter | `tenant`, `agent`, `server`, `tool`, `outcome` (`ok`, `tool_error`, `transport_error`, `timeout`) |
+| `edge_mcp_tool_calls_total` | counter | `tenant`, `agent`, `server`, `tool`, `outcome` (`ok`, `tool_error`, `unreachable`, `transport_error`, `timeout`) |
 | `edge_mcp_tool_call_duration_seconds` | histogram | `tenant`, `agent`, `server`, `tool` |
 | `edge_mcp_server_skipped_total` | counter | `tenant`, `agent`, `server`. A turn skipped a server inside its skip window. |
-| `edge_mcp_skip_window_entered_total` | counter | `tenant`, `agent`, `server`. A timed-out startup discovery or turn start opened a server's skip window. |
+| `edge_mcp_skip_window_entered_total` | counter | `tenant`, `agent`, `server`. A startup discovery or turn start that timed out or could not reach the server opened its skip window. |
 | `edge_mcp_token_exchanges_total` | counter | `tenant`, `agent`, `audience`, `outcome` (`ok`, `failed`) |
 | `edge_mcp_token_exchange_duration_seconds` | histogram | `tenant`, `agent`, `audience` |
 | `edge_mcp_config_refusals_total` | counter | `reason`, one of `missing_primary`, `invalid_id`, `reserved_id`, `duplicate_id`, `invalid_prefix`, `empty_allowlist`, `invalid_grant`, `outside_prefix`, `invalid_audience`, `skip_on_required`, `name_collision` |
