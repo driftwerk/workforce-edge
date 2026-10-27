@@ -634,6 +634,7 @@ impl AgentHost {
             provider = %llm_cfg.provider,
             model = ?model,
             tools = ?mcp.tool_names(),
+            excluded = ?mcp.excluded(),
             mcp = !mcp.is_empty(),
             "edge agent ready"
         );
@@ -2953,6 +2954,11 @@ impl AgentHost {
     pub(crate) fn with_llm_status(mut self, reporter: Arc<LlmStatusReporter>) -> Self {
         self.llm_status = Some(reporter);
         self
+    }
+
+    /// The agent's MCP catalogue, as built.
+    pub(crate) fn mcp(&self) -> &McpCatalogue {
+        &self.mcp
     }
 
     /// Drop the MCP toolset, for tests that drive a whole turn through

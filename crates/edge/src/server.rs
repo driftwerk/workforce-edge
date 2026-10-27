@@ -3918,18 +3918,26 @@ impl EmbedChecks {
 }
 
 /// Shape checks on the integration slice of an embed, shared by create, edit
-/// and import. Each error names the field, so the 422 says what to fix.
-/// Reachability is not checked here: the host build does that under the
-/// tenant's outbound policy.
-fn validate_embed(embed: &EmbedSettings, checks: EmbedChecks) -> std::result::Result<(), String> {
+/// and import. Each error names the field, so the 422 says what to fix. An
+/// MCP URL is checked against the tenant's outbound `policy` as written;
+/// reachability is not checked here.
+fn validate_embed(
+    embed: &EmbedSettings,
+    checks: EmbedChecks,
+    policy: OutboundPolicy,
+) -> std::result::Result<(), String> {
     if checks.mcp {
         if let Some(mcp) = &embed.mcp {
-            check_mcp_url("mcp.url", &mcp.url)?;
+            check_mcp_url("mcp.url", &mcp.url, policy)?;
         }
     }
     if checks.mcp_servers {
         embed.mcp_servers.iter().try_for_each(|s| {
-            check_mcp_url(&format!("mcp_servers[{}].url", s.id), &s.connection.url)
+            check_mcp_url(
+                &format!("mcp_servers[{}].url", s.id),
+                &s.connection.url,
+                policy,
+            )
         })?;
         embed.check_mcp_servers().map_err(|e| {
             crate::metrics::config_refused(e.reason);
@@ -3972,17 +3980,16 @@ fn validate_embed(embed: &EmbedSettings, checks: EmbedChecks) -> std::result::Re
     Ok(())
 }
 
-/// An MCP URL's shape: present, parseable, and http(s).
-fn check_mcp_url(field: &str, url: &str) -> std::result::Result<(), String> {
-    if url.is_empty() {
-        return Err(format!("{field} is required"));
-    }
-    let parsed = url::Url::parse(url).map_err(|e| format!("{field} is not a URL: {e}"))?;
-    if matches!(parsed.scheme(), "http" | "https") {
-        Ok(())
-    } else {
-        Err(format!("{field} must be an http(s) URL"))
-    }
+/// An MCP URL's shape: present, parseable, http(s), and not refused by
+/// `policy` as written.
+fn check_mcp_url(
+    field: &str,
+    url: &str,
+    policy: OutboundPolicy,
+) -> std::result::Result<(), String> {
+    crate::mcp::http_endpoint(url, policy)
+        .map(drop)
+        .map_err(|e| format!("{field} {e}"))
 }
 
 /// A bare hostname as `image_hosts` holds it: lowercase DNS labels, optionally
@@ -4164,7 +4171,7 @@ async fn admin_agent_update(
     let mut agent = host.agent().as_ref().clone();
     let checks = EmbedChecks::for_edit(&body.0);
     apply_edit(&mut agent, body.0);
-    if let Err(e) = validate_embed(&agent.embed, checks) {
+    if let Err(e) = validate_embed(&agent.embed, checks, tenant.outbound()) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             axum::Json(serde_json::json!({"error": e})),
@@ -4384,7 +4391,7 @@ async fn admin_import_git(
             ));
         }
         tidy_embed(&mut agent.embed);
-        if let Err(e) = validate_embed(&agent.embed, EmbedChecks::ALL) {
+        if let Err(e) = validate_embed(&agent.embed, EmbedChecks::ALL, tenant.outbound()) {
             return unprocessable(format!("agent {}: {e}", agent.id));
         }
         // A referenced playbook must come with the repo or already exist.
@@ -4662,7 +4669,7 @@ async fn admin_agent_create(
     };
     let mut agent = agent;
     tidy_embed(&mut agent.embed);
-    if let Err(e) = validate_embed(&agent.embed, EmbedChecks::ALL) {
+    if let Err(e) = validate_embed(&agent.embed, EmbedChecks::ALL, tenant.outbound()) {
         return fail(&e);
     }
     match tenant.apply_agent_edit_inner(agent).await {
@@ -9659,6 +9666,213 @@ mod tenant_tests {
         .await;
     }
 
+    /// Under `public`, a save naming an MCP URL the policy refuses as written
+    /// is a 422 by field, before anything is stored or rebuilt.
+    #[tokio::test]
+    async fn an_admin_save_refuses_a_url_the_policy_refuses_as_written() {
+        let (state, cookie) = wizard_state(
+            OutboundPolicy::Public,
+            HashMap::from([(
+                "support".to_string(),
+                wizard_agent("https://93.184.216.34/mcp"),
+            )]),
+            None,
+        );
+        for (raw, reason) in [
+            (
+                "http://docs.example.com/mcp",
+                "only https URLs may be called",
+            ),
+            (
+                "https://10.0.0.7/mcp",
+                "the host resolves to a private address (10.0.0.7)",
+            ),
+        ] {
+            let docs = serde_json::json!({"mcp_servers": [{"id": "docs", "url": raw,
+                "tool_prefix": "docs", "allowed_tools": ["docs.*"]}]});
+            let primary = serde_json::json!({"mcp": {"url": raw}});
+            for (edit, field) in [(docs, "mcp_servers[docs].url"), (primary, "mcp.url")] {
+                let (status, body) = send(
+                    &state,
+                    request(
+                        Method::PUT,
+                        "/admin/api/agents/support",
+                        &cookie,
+                        Some(edit),
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{raw}: {body}");
+                assert_eq!(
+                    json(&body)["error"],
+                    format!("{field} is refused by the outbound policy: {reason}"),
+                    "{raw}"
+                );
+            }
+        }
+    }
+
+    /// The save judges an MCP URL as written: a host that does not resolve
+    /// passes under `public`, and plain http passes under `private`.
+    #[test]
+    fn validate_embed_judges_mcp_urls_as_written() {
+        let with_docs = |url: &str| crate::agent::EmbedSettings {
+            allowed_tools: vec!["acme.*".into()],
+            mcp: Some(crate::agent::McpSettings {
+                url: "https://93.184.216.34/mcp".into(),
+                ..Default::default()
+            }),
+            mcp_servers: vec![crate::agent::McpServerSettings {
+                id: "docs".into(),
+                connection: crate::agent::McpSettings {
+                    url: url.into(),
+                    ..Default::default()
+                },
+                tool_prefix: Some("docs".into()),
+                allowed_tools: vec!["docs.*".into()],
+                tool_grants: vec![],
+            }],
+            ..Default::default()
+        };
+        for (url, policy) in [
+            (
+                "https://docs.unresolvable.invalid/mcp",
+                OutboundPolicy::Public,
+            ),
+            ("http://docs.example.com/mcp", OutboundPolicy::Private),
+        ] {
+            assert_eq!(
+                validate_embed(&with_docs(url), EmbedChecks::ALL, policy),
+                Ok(()),
+                "{url} under {policy:?}"
+            );
+        }
+        assert!(validate_embed(
+            &with_docs("http://docs.example.com/mcp"),
+            EmbedChecks::ALL,
+            OutboundPolicy::Public
+        )
+        .is_err());
+    }
+
+    /// The incident end to end: a git-managed edge whose optional server's
+    /// URL is an unset placeholder boots without it, a commit that fixes the
+    /// URL restores its tools, a sync that breaks it again applies without
+    /// it, and a required server with the same URL is still refused, keeping
+    /// the running host. The URL never reaches the logs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_git_managed_edge_boots_and_syncs_past_an_unusable_optional_server_and_a_fix_restores_it(
+    ) {
+        use workforce_common::session_postgres::{run_session_migrations, PostgresSessionStore};
+        use workforce_postgres::test_support::with_test_pool;
+
+        use crate::analytics::run_edge_analytics_migrations;
+        use crate::git_config::tests::serve_commit;
+        use crate::mcp::tests::excluded_ids;
+        use crate::mcp::TokenCell;
+        use crate::tenant::{run_edge_migrations, TenantStore};
+
+        const REPO: &str = "acme/edge-config";
+        const SECRET_URL: &str = "docs.example.com/mcp?key=s3cret-git-sync";
+        let logs = captured_logs();
+        with_test_pool(PostgresSessionStore::build_pool, |pool| async move {
+            run_session_migrations(&pool).await.unwrap();
+            run_edge_analytics_migrations(&pool).await.unwrap();
+            run_edge_migrations(&pool).await.unwrap();
+            TenantStore::new(pool.clone())
+                .ensure_default()
+                .await
+                .unwrap();
+            let primary = crate::mcp::tests::mock_mcp(&["harbor.list_orders"]).await;
+            let docs = crate::mcp::tests::mock_mcp(&["search"]).await;
+            let agent_toml = |docs_url: &str, required: bool| {
+                format!(
+                    "id = \"northwind-help\"\ndisplay_name = \"Help\"\nsystem_prompt = \"You help.\"\n\
+                     [embed]\nkeycloak_issuer = \"https://kc.acme.test/realms/staff\"\n\
+                     allowed_tools = [\"harbor.*\"]\n[embed.mcp]\nurl = \"{}/mcp\"\n\
+                     [[embed.mcp_servers]]\nid = \"docs\"\nurl = \"{docs_url}\"\nrequired = {required}\n\
+                     tool_prefix = \"docs\"\nallowed_tools = [\"docs.*\"]\n",
+                    primary.uri()
+                )
+            };
+            let github = wiremock::MockServer::start().await;
+            let commit = |sha: &'static str, docs_url: String, required: bool| {
+                let github = &github;
+                let toml = agent_toml(&docs_url, required);
+                async move {
+                    github.reset().await;
+                    serve_commit(
+                        github,
+                        REPO,
+                        "main",
+                        sha,
+                        &[("agents/northwind-help/agent.toml", &toml)],
+                    )
+                    .await;
+                }
+            };
+            let settings = TenantSettings {
+                git_config: Some(crate::config::GitConfig {
+                    repo: REPO.into(),
+                    git_ref: "main".into(),
+                    token: "ghp_x".into(),
+                    poll_secs: 0,
+                }),
+                outbound: OutboundPolicy::Private,
+                ..TenantSettings::from_edge_toml(&edge_toml())
+            };
+            let infra = SharedInfra::for_tests_on(pool).with_github_api(&github.uri());
+            let host = |runtime: &TenantRuntime| runtime.host("northwind-help").expect("serves");
+            let registry = |host: Arc<AgentHost>| async move {
+                host.mcp()
+                    .registry_for(&TokenCell::new("customer-token"))
+                    .await
+                    .unwrap()
+            };
+
+            commit("sha-1", "${EDGE_TEST_NEVER_SET_DOCS_MCP_URL}".into(), false).await;
+            let runtime = TenantRuntime::build(settings, &infra).await.unwrap();
+            assert_eq!(excluded_ids(host(&runtime).mcp()), ["docs"]);
+            let tools = registry(host(&runtime)).await;
+            assert!(tools.has("harbor.list_orders") && !tools.has("docs.search"));
+
+            commit("sha-2", format!("{}/mcp", docs.uri()), false).await;
+            assert!(runtime.resync_from_git().await.unwrap().changed);
+            assert!(excluded_ids(host(&runtime).mcp()).is_empty());
+            let tools = registry(host(&runtime)).await;
+            assert!(tools.has("harbor.list_orders") && tools.has("docs.search"));
+
+            commit("sha-3", SECRET_URL.into(), false).await;
+            assert!(runtime.resync_from_git().await.unwrap().changed);
+            let synced = host(&runtime);
+            assert_eq!(excluded_ids(synced.mcp()), ["docs"]);
+            let tools = registry(host(&runtime)).await;
+            assert!(tools.has("harbor.list_orders") && !tools.has("docs.search"));
+
+            commit("sha-4", SECRET_URL.into(), true).await;
+            let err = format!("{:#}", runtime.resync_from_git().await.unwrap_err());
+            assert!(
+                err.contains("rebuilding host northwind-help on git sync")
+                    && err.contains("mcp_servers[docs].url is not a URL"),
+                "{err}"
+            );
+            assert!(!err.contains("s3cret-git-sync"), "{err}");
+            assert!(Arc::ptr_eq(&host(&runtime), &synced), "the running host is kept");
+            let logs = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+            assert!(
+                logs.lines().any(|line| line.contains("MCP server excluded")
+                    && line.contains("server=docs")
+                    && line.contains("invalid_url")),
+                "{logs}"
+            );
+            assert!(
+                !logs.contains("s3cret-git-sync"),
+                "the URL reached the logs"
+            );
+        })
+        .await;
+    }
+
     /// A tenant with no database behind it, for the checks that answer
     /// before any store is touched.
     fn store_less_fixture(git_managed: bool) -> (Arc<EdgeState>, String) {
@@ -10880,7 +11094,7 @@ mod tenant_tests {
         assert!(json(&body)["error"]
             .as_str()
             .unwrap()
-            .contains("refusing the MCP URL"));
+            .contains("refused by the outbound policy"));
         assert_eq!(
             mcp.received_requests().await.unwrap().len(),
             before,
