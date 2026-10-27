@@ -395,6 +395,7 @@ mod tests {
             keycloak_issuer: "https://kc".into(),
             keycloak_audience: None,
             mcp: None::<McpSettings>,
+            mcp_servers: vec![],
             branding: Branding::default(),
             passive_memory: None,
             data_tables: None,

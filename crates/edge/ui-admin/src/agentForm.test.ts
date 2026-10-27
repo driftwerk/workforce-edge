@@ -2,12 +2,20 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { importGit, UnresolvedPlaceholders, type Agent } from "./api";
 import {
-  concreteTools,
+  credentialField,
   describeImport,
+  discoverRequest,
+  emptyServerRow,
+  exposedName,
+  hasStoredCredential,
   importRequest,
   integrationEdit,
   integrationForm,
+  mcpServerRows,
+  spillSkipChoices,
+  toggleName,
   withUnresolved,
+  type IntegrationForm,
 } from "./agentForm";
 
 const agent: Agent = {
@@ -38,6 +46,32 @@ const agent: Agent = {
   has_mcp: true,
   mcp_url: "https://mcp.acme.test/mcp",
   has_discovery_credential: true,
+  mcp_settings: {
+    id: "default",
+    url: "https://mcp.acme.test/mcp",
+    auth: "exchanged",
+    audience: null,
+    required: true,
+    unavailable_skip_secs: 60,
+    has_discovery_credential: true,
+    tool_prefix: null,
+    allowed_tools: ["acme.list_orders", "acme.reports.*"],
+    tool_grants: [],
+  },
+  mcp_servers: [
+    {
+      id: "docs",
+      url: "https://docs-mcp.acme.test/mcp",
+      auth: "exchanged",
+      audience: "docs-mcp",
+      required: false,
+      unavailable_skip_secs: 30,
+      has_discovery_credential: true,
+      tool_prefix: "docs",
+      allowed_tools: ["docs.search", "docs.pages.*"],
+      tool_grants: [{ source: "keycloak_role", requires: "editor", tools: ["docs.edit_page"] }],
+    },
+  ],
   permissions: { url: "https://api.acme.test/users/{user}/permissions", cache_ttl_secs: 60 },
   tool_grants: [{ source: "backend_permissions", requires: "items:edit", tools: ["acme.item_transition"] }],
   policy: { confirm_writes: true },
@@ -46,23 +80,51 @@ const agent: Agent = {
   passive_memory: false,
 };
 
+/** The form with the primary connection patched. */
+const withPrimary = (patch: Partial<IntegrationForm["mcp"]>): IntegrationForm => {
+  const f = integrationForm(agent);
+  return { ...f, mcp: { ...f.mcp, ...patch } };
+};
+
 describe("integrationEdit", () => {
   it("loads the agent's integration fields and never a credential", () => {
     const f = integrationForm(agent);
-    expect(f.mcp_url).toBe("https://mcp.acme.test/mcp");
-    expect(f.credential).toBe("");
-    expect(f.clear_credential).toBe(false);
+    expect(f.mcp.url).toBe("https://mcp.acme.test/mcp");
+    expect(f.mcp.credential).toBe("");
+    expect(f.mcp.clear_credential).toBe(false);
+    expect(f.mcp.required).toBe(true);
     expect(f.permissions_ttl).toBe("60");
     expect(f.tool_grants).toEqual([
       { source: "backend_permissions", requires: "items:edit", tools: "acme.item_transition" },
     ]);
     expect(integrationForm().passive_memory).toBe(true);
+    expect(integrationForm().mcp.required).toBe(true);
+    expect(integrationForm().mcp_servers).toEqual([]);
   });
 
-  it("round-trips the loaded form without naming the credential", () => {
+  it("round-trips the loaded form without naming a credential", () => {
     const body = integrationEdit(integrationForm(agent));
     expect(body).toEqual({
-      mcp: { url: "https://mcp.acme.test/mcp" },
+      mcp: {
+        url: "https://mcp.acme.test/mcp",
+        auth: "exchanged",
+        audience: null,
+        required: true,
+        unavailable_skip_secs: null,
+      },
+      mcp_servers: [
+        {
+          id: "docs",
+          url: "https://docs-mcp.acme.test/mcp",
+          auth: "exchanged",
+          audience: "docs-mcp",
+          required: false,
+          unavailable_skip_secs: 30,
+          tool_prefix: "docs",
+          allowed_tools: ["docs.search", "docs.pages.*"],
+          tool_grants: [{ source: "keycloak_role", requires: "editor", tools: ["docs.edit_page"] }],
+        },
+      ],
       permissions: { url: "https://api.acme.test/users/{user}/permissions", cache_ttl_secs: 60 },
       tool_grants: [{ source: "backend_permissions", requires: "items:edit", tools: ["acme.item_transition"] }],
       policy: { confirm_writes: true },
@@ -71,22 +133,35 @@ describe("integrationEdit", () => {
       passive_memory: false,
     });
     expect("discovery_credential" in body.mcp!).toBe(false);
+    expect("discovery_credential" in body.mcp_servers[0]).toBe(false);
   });
 
   it("sends the credential only when typed, and the empty string to clear", () => {
-    const typed = integrationEdit({ ...integrationForm(agent), credential: "  svc-9f8e  " });
+    const typed = integrationEdit(withPrimary({ credential: "  svc-9f8e  " }));
     expect(typed.mcp?.discovery_credential).toBe("svc-9f8e");
-    const cleared = integrationEdit({ ...integrationForm(agent), credential: "ignored", clear_credential: true });
+    const cleared = integrationEdit(withPrimary({ credential: "ignored", clear_credential: true }));
     expect(cleared.mcp?.discovery_credential).toBe("");
-    const blank = integrationEdit({ ...integrationForm(agent), credential: "   " });
+    const blank = integrationEdit(withPrimary({ credential: "   " }));
     expect("discovery_credential" in blank.mcp!).toBe(false);
+    expect(credentialField(" x ", false)).toEqual({ discovery_credential: "x" });
+    expect(credentialField("", true)).toEqual({ discovery_credential: "" });
+    expect(credentialField(" ", false)).toEqual({});
+  });
+
+  it("sends a skip window only for a server that is not required, and an audience only when exchanged", () => {
+    const optional = integrationEdit(withPrimary({ required: false, unavailable_skip_secs: "15" }));
+    expect(optional.mcp).toMatchObject({ required: false, unavailable_skip_secs: 15 });
+    const required = integrationEdit(withPrimary({ required: true, unavailable_skip_secs: "15" }));
+    expect(required.mcp?.unavailable_skip_secs).toBeNull();
+    const forwarded = integrationEdit(withPrimary({ auth: "forwarded", audience: "acme-mcp" }));
+    expect(forwarded.mcp).toMatchObject({ auth: "forwarded", audience: null });
+    const exchanged = integrationEdit(withPrimary({ audience: " acme-mcp " }));
+    expect(exchanged.mcp?.audience).toBe("acme-mcp");
   });
 
   it("drops the blocks a blank field means to remove", () => {
     const body = integrationEdit({
-      ...integrationForm(agent),
-      mcp_url: " ",
-      credential: "would be lost anyway",
+      ...withPrimary({ url: " ", credential: "would be lost anyway" }),
       permissions_url: "",
       confirm_writes: false,
       image_hosts: " \n",
@@ -112,12 +187,98 @@ describe("integrationEdit", () => {
     expect(integrationEdit({ ...integrationForm(agent), permissions_ttl: "0" }).permissions?.cache_ttl_secs).toBeNull();
   });
 
-  it("offers exact names, not globs, to the spill-skip picker", () => {
-    expect(
-      concreteTools(agent.allowed_tools, [
-        { source: "host_hint", requires: "x", tools: "acme.item_transition acme.list_orders" },
-      ]),
-    ).toEqual(["acme.list_orders", "acme.item_transition"]);
+  it("offers every server's exact names, not globs, and what is already picked, to the spill-skip picker", () => {
+    const f: IntegrationForm = {
+      ...integrationForm(agent),
+      tool_grants: [{ source: "host_hint", requires: "x", tools: "acme.item_transition acme.list_orders" }],
+    };
+    expect(spillSkipChoices(agent.allowed_tools, f)).toEqual([
+      "acme.list_orders",
+      "acme.item_transition",
+      "docs.search",
+      "docs.edit_page",
+      "acme.reports.signed_urls",
+    ]);
+  });
+
+  it("keeps a picked tool on offer after the server naming it is removed, so it can be unticked", () => {
+    const f = { ...integrationForm(agent), mcp_servers: [], spill_skip_tools: ["docs.search"] };
+    expect(spillSkipChoices([], f)).toEqual(["acme.item_transition", "docs.search"]);
+  });
+});
+
+describe("additional MCP servers", () => {
+  it("maps an agent's servers to rows, never with a credential", () => {
+    expect(mcpServerRows(agent)).toEqual([
+      {
+        id: "docs",
+        url: "https://docs-mcp.acme.test/mcp",
+        credential: "",
+        clear_credential: false,
+        auth: "exchanged",
+        audience: "docs-mcp",
+        required: false,
+        unavailable_skip_secs: "30",
+        tool_prefix: "docs",
+        allowed_tools: "docs.search docs.pages.*",
+        tool_grants: [{ source: "keycloak_role", requires: "editor", tools: "docs.edit_page" }],
+      },
+    ]);
+    expect(mcpServerRows()).toEqual([]);
+  });
+
+  it("sends a server's credential only when typed or cleared, and drops fully blank rows", () => {
+    const f = integrationForm(agent);
+    const [docs] = f.mcp_servers;
+    const body = integrationEdit({
+      ...f,
+      mcp_servers: [
+        { ...docs, credential: " docs-svc " },
+        emptyServerRow(),
+        { ...emptyServerRow(), id: "half", url: "" },
+      ],
+    });
+    expect(body.mcp_servers.map((s) => s.id)).toEqual(["docs", "half"]);
+    expect(body.mcp_servers[0].discovery_credential).toBe("docs-svc");
+    expect("discovery_credential" in body.mcp_servers[1]).toBe(false);
+    expect(body.mcp_servers[1]).toMatchObject({ url: "", tool_prefix: null, allowed_tools: [], required: false });
+    const cleared = integrationEdit({ ...f, mcp_servers: [{ ...docs, clear_credential: true }] });
+    expect(cleared.mcp_servers[0].discovery_credential).toBe("");
+  });
+
+  it("tells which ids keep a stored credential, as the server matches them by id", () => {
+    expect(hasStoredCredential(agent, "docs")).toBe(true);
+    expect(hasStoredCredential(agent, " docs ")).toBe(true);
+    expect(hasStoredCredential(agent, "docs-renamed")).toBe(false);
+    expect(hasStoredCredential(undefined, "docs")).toBe(false);
+    const readded = { ...emptyServerRow(), id: "docs", url: "https://docs-mcp.acme.test/v2" };
+    expect(hasStoredCredential(agent, readded.id)).toBe(true);
+    const [sent] = integrationEdit({ ...integrationForm(agent), mcp_servers: [readded] }).mcp_servers;
+    expect("discovery_credential" in sent).toBe(false);
+  });
+
+  it("probes discovery with only a typed credential", () => {
+    const [docs] = mcpServerRows(agent);
+    expect(discoverRequest(docs)).toEqual({ url: "https://docs-mcp.acme.test/mcp" });
+    expect(discoverRequest({ ...docs, credential: " svc " })).toEqual({
+      url: "https://docs-mcp.acme.test/mcp",
+      discovery_credential: "svc",
+    });
+    expect(discoverRequest({ ...docs, credential: "svc", clear_credential: true })).toEqual({
+      url: "https://docs-mcp.acme.test/mcp",
+    });
+  });
+
+  it("always sends the list, so removing every row removes them all", () => {
+    expect(integrationEdit({ ...integrationForm(agent), mcp_servers: [] }).mcp_servers).toEqual([]);
+  });
+
+  it("names discovered tools under the prefix and toggles them in the allowlist", () => {
+    expect(exposedName(" docs ", "search")).toBe("docs.search");
+    expect(exposedName("", "search")).toBe("search");
+    expect(toggleName("docs.search", "docs.get_page", true)).toBe("docs.search docs.get_page");
+    expect(toggleName("docs.search docs.get_page", "docs.search", true)).toBe("docs.search docs.get_page");
+    expect(toggleName("docs.search, docs.get_page", "docs.search", false)).toBe("docs.get_page");
   });
 });
 

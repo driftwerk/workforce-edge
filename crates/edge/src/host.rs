@@ -40,7 +40,6 @@ use workforce_common::session::SessionAttachment;
 use workforce_common::session::{MessageRole, Session, SessionStore};
 use workforce_common::stream_redact::{RoundMark, StreamRedactor};
 use workforce_core::types::AgentId;
-use workforce_mcp_client::{AuthProvider, StaticBearer};
 use workforce_memory::store::MemoryStore;
 use workforce_memory::types::{Memory, MemoryFilter, MemoryId, MemorySearchResult, Visibility};
 use workforce_policy::engine::PolicyEngine;
@@ -52,7 +51,8 @@ use crate::analytics::{
 };
 use crate::boot::DataPlane;
 use crate::config::LlmConfig;
-use crate::mcp::{McpToolset, SharedBearer, TokenCell};
+use crate::mcp::{McpCatalogue, TokenCell};
+use crate::metrics::AgentScope;
 use crate::outbound::OutboundPolicy;
 use crate::playbook::{AgentPlaybooks, EdgePlaybookTool, PlaybookCatalog};
 use crate::settings::LlmStatusReporter;
@@ -65,6 +65,18 @@ use workforce_memory::audit::DerivedFigureDetector;
 /// restrict further.
 const ALLOW_ALL_POLICY: &str =
     "rules:\n  - name: allow-all\n    scope: global\n    tool: \"*\"\n    action: allow\n";
+
+/// Every tool the host registers itself, after the MCP tools. An MCP tool that
+/// would reach the model under one of these names is dropped at discovery.
+pub(crate) const BUILT_IN_TOOLS: &[&str] = &[
+    "memory",
+    "edge.version",
+    workforce_agent::tools::export_xlsx::EXPORT_XLSX_TOOL_NAME,
+    workforce_agent::tools::data::DATA_QUERY_TOOL_NAME,
+    workforce_agent::tools::data::DATA_INSPECT_TOOL_NAME,
+    "playbook",
+    "image.fetch",
+];
 
 /// Tool-round cap for a single customer turn.
 const MAX_ROUNDS: u32 = 24;
@@ -283,8 +295,8 @@ pub struct AgentHost {
     llm: Arc<dyn LlmProvider>,
     policy: Arc<PolicyEngine>,
     sessions: Arc<dyn SessionStore>,
-    /// The agent's company MCP, or `None` for a tool-less pure-chat agent.
-    mcp: Option<McpToolset>,
+    /// The agent's company MCP servers; empty for a tool-less pure-chat agent.
+    mcp: McpCatalogue,
     /// The edge's own Weaviate — all agent memory reads/writes go here.
     memory: Arc<dyn MemoryStore>,
     /// Refuses derived figures as memories, in this agent's vocabulary.
@@ -298,10 +310,6 @@ pub struct AgentHost {
     playbook_catalog: Arc<PlaybookCatalog>,
     /// Tier equivalences, so mid-run model routing can resolve tiers.
     tier_registry: TierRegistry,
-    /// RFC 8693 exchanger (install-level, opt-in): mints a fresh, optionally
-    /// audience-scoped downstream token per turn instead of forwarding the
-    /// customer's raw token to the company MCP.
-    token_exchange: Option<Arc<crate::token_exchange::TokenExchanger>>,
     /// One in-flight turn per conversation: a second concurrent turn (another
     /// tab on the same conversation) is rejected, not queued — the session is
     /// saved wholesale after a turn, so racing turns would silently drop the
@@ -518,7 +526,7 @@ pub struct TurnRequest {
 impl AgentHost {
     /// Build a host for one agent: LLM provider, permissive policy, the agent's
     /// own Postgres session store, and its allowlisted MCP tool catalogue.
-    /// Discovery failure aborts startup — fail closed.
+    /// A required server's discovery failure aborts startup — fail closed.
     pub async fn build(
         agent: Arc<EdgeAgent>,
         data_plane: &DataPlane,
@@ -605,9 +613,14 @@ impl AgentHost {
             PolicyEngine::from_yaml(ALLOW_ALL_POLICY).wrap_err("building edge policy engine")?,
         );
         let sessions: Arc<dyn SessionStore> = data_plane.session_store(&agent.id);
-        let mcp = McpToolset::discover_with(&agent.embed, outbound)
-            .await
-            .wrap_err_with(|| format!("discovering MCP tools for agent {}", agent.id))?;
+        let mcp = McpCatalogue::build(
+            AgentScope::new(data_plane.tenant.as_str(), &agent.id),
+            &agent.embed,
+            outbound,
+            token_exchange,
+        )
+        .await
+        .wrap_err_with(|| format!("discovering MCP tools for agent {}", agent.id))?;
         if agent.embed.keycloak_audience.is_none() {
             tracing::warn!(
                 agent = %agent.id,
@@ -620,8 +633,8 @@ impl AgentHost {
             agent = %agent.id,
             provider = %llm_cfg.provider,
             model = ?model,
-            tools = ?mcp.as_ref().map(|m| m.tool_names()).unwrap_or_default(),
-            mcp = mcp.is_some(),
+            tools = ?mcp.tool_names(),
+            mcp = !mcp.is_empty(),
             "edge agent ready"
         );
         // Answer grader (opt-in). Defaults its model to the agent's own spec; a
@@ -657,7 +670,6 @@ impl AgentHost {
             provider: kind,
             playbook_catalog,
             tier_registry,
-            token_exchange,
             turn_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
             begin_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -692,6 +704,13 @@ impl AgentHost {
     /// The agent this host serves.
     pub fn agent(&self) -> &Arc<EdgeAgent> {
         &self.agent
+    }
+
+    /// Stop this host's background work once it is unmounted or replaced.
+    /// Turns still running on it finish; an MCP server they reach that was
+    /// not yet discovered is discovered lazily, as on any first turn.
+    pub(crate) fn retire(&self) {
+        self.mcp.retire();
     }
 
     /// The agent's session store — for the owner-scoped conversation read API.
@@ -1304,7 +1323,7 @@ impl AgentHost {
     ) -> crate::permissions::UserCapabilities {
         use crate::agent::GrantSource;
         let mut caps = crate::permissions::UserCapabilities::default();
-        let grants = &self.agent.embed.tool_grants;
+        let grants: Vec<_> = self.agent.embed.all_tool_grants().collect();
         let bearer = req.mcp_token.get();
         // backend_permissions: fetch (and cache) the user's resolved permission
         // set from the install's own RBAC endpoint.
@@ -1350,37 +1369,18 @@ impl AgentHost {
         // a disconnect during connect doesn't leave the turn running. A tool-less
         // agent (no MCP configured) skips discovery and starts with an empty
         // registry — the memory tool below is still added.
-        let tools = match &self.mcp {
-            None => Arc::new(ToolRegistry::new()),
-            Some(mcp) => tokio::select! {
+        let tools = if self.mcp.is_empty() {
+            Arc::new(ToolRegistry::new())
+        } else {
+            // RFC 8693, inside the catalogue: each turn mints fresh tokens for
+            // the servers' audiences (a fresh mint carries the full realm TTL, so
+            // it is static for the turn). Without exchange — and on exchange
+            // failure — servers authenticate with the live customer token cell
+            // so a mid-turn refresh reaches later calls.
+            tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Ok(()),
-                result = async {
-                    // RFC 8693: mint a fresh, optionally audience-scoped token for
-                    // this turn's MCP calls (a fresh mint carries the full realm
-                    // TTL, so it is static for the turn). Without exchange — and on
-                    // exchange failure — authenticate with the live customer token
-                    // cell so a mid-turn refresh reaches later calls; log a failed
-                    // exchange loudly so the degraded path is never silent.
-                    let auth: Arc<dyn AuthProvider> = match &self.token_exchange {
-                        Some(exchanger) => {
-                            let subject = req.mcp_token.get();
-                            match exchanger.exchange(&subject).await {
-                                Ok(token) => Arc::new(StaticBearer::new(token)),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        agent = %self.agent.id,
-                                        error = %e,
-                                        "token exchange failed; falling back to the customer's own token"
-                                    );
-                                    Arc::new(SharedBearer::new(req.mcp_token.clone()))
-                                }
-                            }
-                        }
-                        None => Arc::new(SharedBearer::new(req.mcp_token.clone())),
-                    };
-                    mcp.registry_for(auth).await
-                } => match result {
+                result = self.mcp.registry_for(&req.mcp_token) => match result {
                     Ok(tools) => tools,
                     Err(e) => {
                         tracing::warn!(agent = %self.agent.id, error = %e, "MCP unavailable for turn");
@@ -1393,28 +1393,16 @@ impl AgentHost {
                         return Ok(());
                     }
                 },
-            },
+            }
         };
-        // Per-user tool tiers: the toolset above discovered the UNION of base +
+        // Per-user tool tiers: every server discovered the UNION of its base +
         // grant tools; narrow it to what THIS user may use. Any write-tier tool
         // the user hasn't unlocked is unregistered, so the model never sees it.
         // Security is unaffected — the backend enforces every write on the
         // forwarded token; this is UX + defence-in-depth. No grants ⇒ no work.
-        if !self.agent.embed.tool_grants.is_empty() {
+        if self.agent.embed.all_tool_grants().next().is_some() {
             let caps = self.resolve_capabilities(&req).await;
-            let effective: std::collections::HashSet<String> = self
-                .agent
-                .embed
-                .effective_allowed_tools(|g| caps.satisfies(g))
-                .into_iter()
-                .collect();
-            for grant in &self.agent.embed.tool_grants {
-                for t in &grant.tools {
-                    if !effective.contains(t) {
-                        tools.unregister(t);
-                    }
-                }
-            }
+            withhold_ungranted_tools(&tools, &self.agent.embed, |g| caps.satisfies(g));
         }
         // Always give the agent its memory tool, scoped to this customer — memory
         // is core, not gated by the company-MCP allowlist.
@@ -1773,7 +1761,11 @@ impl AgentHost {
                         // before the first answer token.
                         if let ProgressEvent::ToolStart { name, detail, .. } = &event {
                             if let Some(label) =
-                                progress_label(name, detail, &self.agent.progress_labels)
+                                progress_label(
+                                    self.mcp.local_tool_name(name),
+                                    detail,
+                                    &self.agent.progress_labels,
+                                )
                             {
                                 if events.send(CustomerEvent::Progress { label }).await.is_err() {
                                     cancel.cancel();
@@ -2418,6 +2410,26 @@ fn answer_delta(event: &ProgressEvent) -> Option<&str> {
     }
 }
 
+/// Unregister every grant tool, on any server, that the user's grants do not
+/// unlock — so the model never sees a write tier the user lacks.
+fn withhold_ungranted_tools(
+    tools: &ToolRegistry,
+    embed: &crate::agent::EmbedSettings,
+    is_granted: impl Fn(&crate::agent::ToolGrant) -> bool,
+) {
+    let effective: std::collections::HashSet<String> = embed
+        .effective_allowed_tools(is_granted)
+        .into_iter()
+        .collect();
+    embed
+        .all_tool_grants()
+        .flat_map(|g| &g.tools)
+        .filter(|t| !effective.contains(*t))
+        .for_each(|t| {
+            tools.unregister(t);
+        });
+}
+
 /// The active-turn registry key. Conversations are only unique per owner (the
 /// session store scopes by both), so the registry must be too — a guessed
 /// conversation id must never reach another customer's turn.
@@ -2882,7 +2894,7 @@ impl AgentHost {
             llm,
             policy: Arc::new(PolicyEngine::from_yaml(ALLOW_ALL_POLICY).unwrap()),
             sessions,
-            mcp: Some(McpToolset::empty()),
+            mcp: McpCatalogue::single(crate::mcp::McpToolset::empty()),
             derived_figures: Arc::new(DerivedFigureDetector::default()),
             // Points at a closed port so recall fails fast (best-effort) rather
             // than hitting a real Weaviate during tests.
@@ -2894,7 +2906,6 @@ impl AgentHost {
             provider: ProviderKind::Anthropic,
             playbook_catalog: PlaybookCatalog::new(std::collections::HashMap::new()),
             tier_registry: TierRegistry::new(None),
-            token_exchange: None,
             turn_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
             begin_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -2949,7 +2960,7 @@ impl AgentHost {
     /// endpoint, so its per-turn `initialize` would fail discovery. A tool-less
     /// agent skips discovery and still gets its memory tool.
     pub(crate) fn tool_less(mut self) -> Self {
-        self.mcp = None;
+        self.mcp = McpCatalogue::default();
         self
     }
 
@@ -3108,7 +3119,9 @@ pub(crate) mod tests {
                 mcp: Some(McpSettings {
                     url: "http://mcp".into(),
                     discovery_credential: None,
+                    ..Default::default()
                 }),
+                mcp_servers: vec![],
                 branding: Branding::default(),
                 passive_memory: None,
                 data_tables: None,
@@ -4589,6 +4602,152 @@ prompt = "Confirm."
             progress_label("lead_invoke_query", "getInvoice", &labels).as_deref(),
             Some("Looking up invoices")
         );
+    }
+
+    /// A prefixed tool labels exactly as its unprefixed self would, in the
+    /// dotted or the wire form; an unprefixed tool keeps today's label.
+    #[test]
+    fn a_prefixed_tool_labels_like_its_unprefixed_self() {
+        use crate::mcp::McpToolset;
+        let mut docs = McpToolset::empty();
+        docs.set_tool_prefix_for_test("docs");
+        let catalogue = McpCatalogue::of(vec![McpToolset::empty(), docs]);
+        let labels = [ProgressLabel {
+            needle: "lead".into(),
+            label: "leads".into(),
+        }];
+        for (prefixed, plain) in [
+            ("docs.list_leads", "list_leads"),
+            ("docs_create_lead", "create_lead"),
+            ("docs_harbor_search_operations", "harbor_search_operations"),
+        ] {
+            assert_eq!(
+                progress_label(catalogue.local_tool_name(prefixed), "", &labels),
+                progress_label(plain, "", &labels),
+                "{prefixed}"
+            );
+        }
+        assert_eq!(
+            progress_label(
+                catalogue.local_tool_name("docs_harbor_search_operations"),
+                "",
+                &labels
+            )
+            .as_deref(),
+            Some("Finding the right lookup")
+        );
+        assert_eq!(
+            progress_label(catalogue.local_tool_name("crm_send_quote"), "", &labels),
+            progress_label("crm_send_quote", "", &labels)
+        );
+    }
+
+    /// Write tiers narrow per server: a grant on an additional server unlocks
+    /// its own tool and nothing else, and every other server's base tools stay.
+    #[test]
+    fn ungranted_tools_are_withheld_on_every_server() {
+        use crate::agent::{GrantSource, McpServerSettings, ToolGrant};
+        let grant = |requires: &str, tool: &str| ToolGrant {
+            source: GrantSource::KeycloakRole,
+            requires: requires.into(),
+            tools: vec![tool.into()],
+        };
+        let embed = EmbedSettings {
+            allowed_tools: vec!["harbor.list_orders".into()],
+            tool_grants: vec![grant("orders:edit", "harbor.cancel_order")],
+            mcp_servers: vec![McpServerSettings {
+                id: "docs".into(),
+                tool_prefix: Some("docs".into()),
+                allowed_tools: vec!["docs.search".into()],
+                tool_grants: vec![grant("editor", "docs.edit_page")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let registry = || {
+            let tools = ToolRegistry::new();
+            for name in [
+                "harbor.list_orders",
+                "harbor.cancel_order",
+                "docs.search",
+                "docs.edit_page",
+            ] {
+                tools.register(Arc::new(NamedTool(name)));
+            }
+            tools
+        };
+        let editor = registry();
+        withhold_ungranted_tools(&editor, &embed, |g| g.requires == "editor");
+        let mut names = editor.names();
+        names.sort();
+        assert_eq!(
+            names,
+            ["docs.edit_page", "docs.search", "harbor.list_orders"]
+        );
+
+        let nobody = registry();
+        withhold_ungranted_tools(&nobody, &embed, |_| false);
+        let mut names = nobody.names();
+        names.sort();
+        assert_eq!(names, ["docs.search", "harbor.list_orders"]);
+    }
+
+    /// A `backend_permissions` grant that exists only on an additional server
+    /// still fetches the user's permissions, and the tool it unlocks survives
+    /// narrowing for a user who holds the permission.
+    #[tokio::test]
+    async fn an_additional_servers_backend_grant_fetches_permissions() {
+        use crate::agent::{GrantSource, McpServerSettings, PermissionsConfig, ToolGrant};
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        let backend = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"permissions": ["docs:edit"], "roles": []})),
+            )
+            .mount(&backend)
+            .await;
+        let embed = EmbedSettings {
+            keycloak_issuer: format!("{}/realms/acme", backend.uri()),
+            allowed_tools: vec!["harbor.list_orders".into()],
+            permissions: Some(PermissionsConfig {
+                url: format!("{}/users/{{user}}/permissions", backend.uri()),
+                cache_ttl_secs: None,
+            }),
+            mcp_servers: vec![McpServerSettings {
+                id: "docs".into(),
+                tool_prefix: Some("docs".into()),
+                allowed_tools: vec!["docs.search".into()],
+                tool_grants: vec![ToolGrant {
+                    source: GrantSource::BackendPermissions,
+                    requires: "docs:edit".into(),
+                    tools: vec!["docs.edit_page".into()],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let host = AgentHost::for_test(
+            Arc::new(EdgeAgent {
+                id: "acme-help".into(),
+                embed: embed.clone(),
+                ..Default::default()
+            }),
+            Arc::new(BlockingProvider),
+            Arc::new(InMemorySessionStore::new()),
+        );
+        let caps = host.resolve_capabilities(&req()).await;
+        assert!(
+            !backend.received_requests().await.unwrap().is_empty(),
+            "the permissions endpoint was asked"
+        );
+        let tools = ToolRegistry::new();
+        for name in ["harbor.list_orders", "docs.search", "docs.edit_page"] {
+            tools.register(Arc::new(NamedTool(name)));
+        }
+        withhold_ungranted_tools(&tools, &embed, |g| caps.satisfies(g));
+        assert!(tools.has("docs.edit_page"), "{:?}", tools.names());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

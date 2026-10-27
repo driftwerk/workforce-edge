@@ -4,7 +4,11 @@ import type {
   GitImportReport,
   GitImportRequest,
   GrantSource,
+  McpAuth,
+  McpDiscoverRequest,
   McpEdit,
+  McpServer,
+  McpServerEdit,
   ToolGrant,
 } from "./api";
 
@@ -40,12 +44,36 @@ export interface GrantRow {
   tools: string;
 }
 
-export interface IntegrationForm {
-  mcp_url: string;
+/** How long a server that is not required sits out after a timed-out turn
+ *  start, when it names no window of its own. */
+export const DEFAULT_SKIP_SECS = 60;
+
+/** An MCP server's connection as the editor holds it. */
+export interface McpConnectionRow {
+  url: string;
   /** What was typed into the credential field; blank = say nothing. */
   credential: string;
   /** The operator asked to clear the stored credential on save. */
   clear_credential: boolean;
+  auth: McpAuth;
+  audience: string;
+  required: boolean;
+  unavailable_skip_secs: string;
+}
+
+/** An additional MCP server as the editor holds it. */
+export interface McpServerRow extends McpConnectionRow {
+  id: string;
+  tool_prefix: string;
+  /** Space/comma/newline separated. */
+  allowed_tools: string;
+  tool_grants: GrantRow[];
+}
+
+export interface IntegrationForm {
+  /** The primary server; a blank URL is a pure-chat agent. */
+  mcp: McpConnectionRow;
+  mcp_servers: McpServerRow[];
   permissions_url: string;
   permissions_ttl: string;
   tool_grants: GrantRow[];
@@ -56,21 +84,58 @@ export interface IntegrationForm {
   passive_memory: boolean;
 }
 
-export function integrationForm(agent?: Agent): IntegrationForm {
+const grantRows = (grants: ToolGrant[]): GrantRow[] =>
+  grants.map((g) => ({ source: g.source, requires: g.requires, tools: g.tools.join(" ") }));
+
+/** Grant rows with nothing in them are dropped; half-filled ones go to the
+ *  server, which names what is missing. */
+const grantEdits = (rows: GrantRow[]): ToolGrant[] =>
+  rows
+    .map((g) => ({ source: g.source, requires: g.requires.trim(), tools: names(g.tools) }))
+    .filter((g) => g.requires || g.tools.length);
+
+function connectionRow(server: McpServer | null | undefined, requiredByDefault: boolean): McpConnectionRow {
   return {
-    mcp_url: agent?.mcp_url ?? "",
+    url: server?.url ?? "",
     credential: "",
     clear_credential: false,
+    auth: server?.auth ?? "exchanged",
+    audience: server?.audience ?? "",
+    required: server?.required ?? requiredByDefault,
+    unavailable_skip_secs: String(server?.unavailable_skip_secs ?? DEFAULT_SKIP_SECS),
+  };
+}
+
+/** A new, empty additional server. */
+export const emptyServerRow = (): McpServerRow => ({
+  ...connectionRow(null, false),
+  id: "",
+  tool_prefix: "",
+  allowed_tools: "",
+  tool_grants: [],
+});
+
+/** An agent's additional servers as editor rows. */
+export function mcpServerRows(agent?: Agent): McpServerRow[] {
+  return (agent?.mcp_servers ?? []).map((s) => ({
+    ...connectionRow(s, false),
+    id: s.id,
+    tool_prefix: s.tool_prefix ?? "",
+    allowed_tools: s.allowed_tools.join(" "),
+    tool_grants: grantRows(s.tool_grants),
+  }));
+}
+
+export function integrationForm(agent?: Agent): IntegrationForm {
+  return {
+    mcp: connectionRow(agent?.mcp_settings, true),
+    mcp_servers: mcpServerRows(agent),
     permissions_url: agent?.permissions?.url ?? "",
     permissions_ttl:
       agent?.permissions?.cache_ttl_secs === null || agent?.permissions?.cache_ttl_secs === undefined
         ? ""
         : String(agent.permissions.cache_ttl_secs),
-    tool_grants: (agent?.tool_grants ?? []).map((g) => ({
-      source: g.source,
-      requires: g.requires,
-      tools: g.tools.join(" "),
-    })),
+    tool_grants: grantRows(agent?.tool_grants ?? []),
     confirm_writes: agent?.policy?.confirm_writes ?? false,
     image_hosts: (agent?.image_hosts ?? []).join("\n"),
     spill_skip_tools: agent?.spill_skip_tools ?? [],
@@ -78,18 +143,62 @@ export function integrationForm(agent?: Agent): IntegrationForm {
   };
 }
 
+/** The write-only credential as a body carries it: the key is present only
+ *  when the operator typed one or asked to clear it (sent as ""), so an
+ *  ordinary save leaves the stored credential alone. */
+export function credentialField(credential: string, clear: boolean): Pick<McpEdit, "discovery_credential"> {
+  if (clear) return { discovery_credential: "" };
+  const typed = credential.trim();
+  return typed ? { discovery_credential: typed } : {};
+}
+
+/** A connection as a body carries it. A required server is never skipped, so
+ *  its skip window is sent as null (the default). */
+function connectionEdit(c: McpConnectionRow): McpEdit {
+  const secs = Number.parseInt(c.unavailable_skip_secs, 10);
+  return {
+    url: c.url.trim(),
+    auth: c.auth,
+    audience: c.auth === "exchanged" ? c.audience.trim() || null : null,
+    required: c.required,
+    unavailable_skip_secs: c.required || Number.isNaN(secs) || secs < 0 ? null : secs,
+    ...credentialField(c.credential, c.clear_credential),
+  };
+}
+
+/** Whether a save keeps a stored credential for the additional server named
+ *  `id`. The server keeps the credential of the stored server with the same
+ *  id, so a renamed row starts without one and a re-added id gets the old one back. */
+export const hasStoredCredential = (agent: Agent | undefined, id: string): boolean =>
+  agent?.mcp_servers.some((s) => s.id === id.trim() && s.has_discovery_credential) ?? false;
+
+/** The discovery probe for a connection: only a credential typed into the
+ *  form travels, never a stored one, and none while clearing. */
+export function discoverRequest(c: McpConnectionRow): McpDiscoverRequest {
+  const typed = c.clear_credential ? "" : c.credential.trim();
+  return { url: c.url.trim(), ...(typed ? { discovery_credential: typed } : {}) };
+}
+
+const blankServerRow = (r: McpServerRow): boolean =>
+  !r.id.trim() &&
+  !r.url.trim() &&
+  !r.tool_prefix.trim() &&
+  !names(r.allowed_tools).length &&
+  !r.credential.trim() &&
+  grantEdits(r.tool_grants).length === 0;
+
 /** The integration slice of a PUT (or create) body. `mcp` is null for a
- *  blank URL (a pure-chat agent); inside it the credential key is present
- *  only when the operator typed one or asked to clear it (sent as ""), so
- *  an ordinary save leaves the stored credential alone. Grant rows with
- *  nothing in them are dropped; half-filled ones go to the server, which
- *  names what is missing. */
+ *  blank URL (a pure-chat agent). `mcp_servers` is always the whole list the
+ *  form holds, so removing every row sends []; rows with nothing in them are
+ *  dropped and half-filled ones go to the server, which names what is
+ *  missing. */
 export function integrationEdit(
   f: IntegrationForm,
 ): Required<
   Pick<
     AgentEdit,
     | "mcp"
+    | "mcp_servers"
     | "permissions"
     | "tool_grants"
     | "policy"
@@ -98,24 +207,24 @@ export function integrationEdit(
     | "passive_memory"
   >
 > {
-  const url = f.mcp_url.trim();
-  let mcp: McpEdit | null = null;
-  if (url) {
-    mcp = { url };
-    if (f.clear_credential) mcp.discovery_credential = "";
-    else if (f.credential.trim()) mcp.discovery_credential = f.credential.trim();
-  }
   const permissionsUrl = f.permissions_url.trim();
   const ttl = Number.parseInt(f.permissions_ttl, 10);
-  const tool_grants: ToolGrant[] = f.tool_grants
-    .map((g) => ({ source: g.source, requires: g.requires.trim(), tools: names(g.tools) }))
-    .filter((g) => g.requires || g.tools.length);
+  const mcp_servers: McpServerEdit[] = f.mcp_servers
+    .filter((r) => !blankServerRow(r))
+    .map((r) => ({
+      ...connectionEdit(r),
+      id: r.id.trim(),
+      tool_prefix: r.tool_prefix.trim() || null,
+      allowed_tools: names(r.allowed_tools),
+      tool_grants: grantEdits(r.tool_grants),
+    }));
   return {
-    mcp,
+    mcp: f.mcp.url.trim() ? connectionEdit(f.mcp) : null,
+    mcp_servers,
     permissions: permissionsUrl
       ? { url: permissionsUrl, cache_ttl_secs: Number.isNaN(ttl) || ttl <= 0 ? null : ttl }
       : null,
-    tool_grants,
+    tool_grants: grantEdits(f.tool_grants),
     policy: f.confirm_writes ? { confirm_writes: true } : null,
     image_hosts: lines(f.image_hosts),
     spill_skip_tools: f.spill_skip_tools,
@@ -123,15 +232,27 @@ export function integrationEdit(
   };
 }
 
-/** The exact tool names an agent has — what the spill-skip picker offers:
- *  the allowlist's exact entries (a `prefix.*` glob names nothing to pick)
- *  plus every granted tool. */
-export function concreteTools(allowedTools: string[], grants: GrantRow[]): string[] {
-  const out: string[] = [];
-  for (const t of [...allowedTools, ...grants.flatMap((g) => names(g.tools))]) {
-    if (!t.endsWith(".*") && !out.includes(t)) out.push(t);
-  }
-  return out;
+/** What the spill-skip picker offers: every server's exact allowlist
+ *  entries (a `prefix.*` glob names nothing to pick) and granted tools, plus
+ *  whatever is already picked, so an entry an edit orphaned can be unticked. */
+export function spillSkipChoices(allowedTools: string[], f: IntegrationForm): string[] {
+  const exact = [
+    ...allowedTools,
+    ...f.tool_grants.flatMap((g) => names(g.tools)),
+    ...f.mcp_servers.flatMap((s) => [...names(s.allowed_tools), ...s.tool_grants.flatMap((g) => names(g.tools))]),
+  ].filter((t) => !t.endsWith(".*"));
+  return [...new Set([...exact, ...f.spill_skip_tools])];
+}
+
+/** A discovered tool's name as the agent will see it, under `prefix`. */
+export const exposedName = (prefix: string, tool: string): string =>
+  prefix.trim() ? `${prefix.trim()}.${tool}` : tool;
+
+/** `field` (a names list) with `tool` added or removed. */
+export function toggleName(field: string, tool: string, on: boolean): string {
+  const current = names(field);
+  const next = on ? (current.includes(tool) ? current : [...current, tool]) : current.filter((t) => t !== tool);
+  return next.join(" ");
 }
 
 export interface EnvRow {
