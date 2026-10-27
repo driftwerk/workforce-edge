@@ -56,6 +56,14 @@ provider = "bedrock"
 # ("powerful" / "standard" / "cheap") or a concrete model id.
 default_model = "standard"
 
+# OPTIONAL. Prometheus metrics at GET /metrics (the edge_mcp_* series; see the
+# README). Off unless enabled. When on, a scraper must send
+# `Authorization: Bearer <bearer_token>`; the token must be at least 32
+# characters, and the endpoint is never served without one.
+# [metrics]
+# enabled = true
+# bearer_token = "${EDGE_METRICS_TOKEN}"
+
 # One or more customer-facing agents. Each is embeddable in the company webapp
 # whose origins it names.
 [[agents]]
@@ -87,11 +95,66 @@ keycloak_issuer = "https://auth.harbor.example/realms/harbor"
 [agents.embed.mcp]
 # The company MCP server this agent acts against, as the logged-in customer.
 url = "https://mcp.harbor.example"
-# OPTIONAL. A service credential to discover the tool list at startup. Omit it
+# OPTIONAL. A service credential to discover the tool list at startup: before
+# the agent serves when the server is required, in the background otherwise,
+# so a server that is not required never delays boot or an admin save. Omit it
 # and the tools are discovered lazily on the first customer turn using that
 # customer's own token — for MCP servers that accept any valid user token.
-# Per-customer tool calls always forward the customer's own token regardless.
+# Per-customer tool calls always carry the customer's own token regardless.
 # discovery_credential = "SERVICE_TOKEN"
+# OPTIONAL, and the same on every server, this one included:
+# - auth: "exchanged" (default) sends the turn's [token_exchange] token when
+#   exchange is configured, else (or if the exchange fails) the customer's own
+#   token. "forwarded" always sends the customer's own token.
+# - audience: the audience this server's token is exchanged for, so a token
+#   minted for it is not accepted by another server. Default: the
+#   [token_exchange] audience. Only with auth = "exchanged".
+# - required: whether this server being unavailable fails startup and the
+#   turn. Default true here (the primary server) and false on an additional
+#   server, whose outage only removes its tools for that turn.
+# - unavailable_skip_secs: how long a server that is not required sits out
+#   after its startup discovery or turn start timed out. Default 60; 0 never
+#   skips.
+# auth = "exchanged"
+# audience = "harbor-mcp"
+
+# OPTIONAL. More MCP servers alongside the primary one above. Each one has its
+# own URL, credential, allowlist and write tiers. `allowed_tools` and
+# `tool_grants` on [agents.embed] belong to the primary server.
+#
+# Tool names must be distinct across every server, compared with "." and "_"
+# as the same character (that is how the model sees them). A config where two
+# servers could expose the same name is refused, and the error names both.
+# Give a server a `tool_prefix` to separate them: two servers that both have
+# a `search` tool can both be used once one is `docs.search`.
+#
+# Every server receives a token that acts as the customer. Give each one its
+# own `audience`, so a server can only use the token it was sent at that server.
+# Servers without an audience share the [token_exchange] one.
+#
+# [[agents.embed.mcp_servers]]
+# # Stable id: names the server in logs, errors, the admin API and the sealed
+# # credential. Lowercase letters, digits and dashes; "default" is the
+# # primary's.
+# id = "docs"
+# url = "https://docs-mcp.harbor.example/mcp"
+# # discovery_credential = "DOCS_SERVICE_TOKEN"
+# audience = "docs-mcp"
+# # Exposes every tool as "docs.<tool>"; the server is still called with the
+# # raw name.
+# tool_prefix = "docs"
+# # This server's closed allowlist, in the names the agent sees (prefix
+# # included). Required.
+# allowed_tools = ["docs.search", "docs.get_page"]
+# # Write tiers on this server, exactly like [agents.embed] tool_grants.
+# tool_grants = [{ source = "keycloak_role", requires = "docs-editor", tools = ["docs.edit_page"] }]
+#
+# [[agents.embed.mcp_servers]]
+# id = "billing"
+# url = "https://billing-mcp.harbor.example/mcp"
+# auth = "forwarded"
+# required = true
+# allowed_tools = ["billing.list_invoices", "billing.get_invoice"]
 
 [agents.embed.branding]
 title = "Harbor Help"

@@ -231,6 +231,8 @@ table.audit .mono { font-family: var(--mono); font-size: 12px; }
 .grant-row { display: grid; grid-template-columns: 160px 1fr 2fr auto; gap: 8px; margin-bottom: 8px; align-items: center; }
 .env-row { display: grid; grid-template-columns: 1fr 2fr auto; gap: 8px; margin-bottom: 8px; align-items: center; }
 .grant-row .select { width: 100%; }
+.server-row { border: 1px solid var(--border); border-radius: var(--r); padding: 12px 14px; margin-bottom: 10px;
+  background: var(--panel-2); }
 .op-row { display: flex; justify-content: space-between; align-items: center; background: var(--panel);
   border: 1px solid var(--border); border-radius: var(--r); padding: 11px 15px; margin-bottom: 8px; box-shadow: var(--shadow-sm); }
 .op-row strong { font-weight: 600; }

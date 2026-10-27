@@ -776,7 +776,8 @@ impl TenantRuntime {
                 .wrap_err_with(|| format!("rebuilding host {id} on git sync"))?;
             new_hosts.insert(id, Arc::new(host));
         }
-        *self.hosts.write().expect("hosts lock") = new_hosts;
+        let retired = std::mem::replace(&mut *self.hosts.write().expect("hosts lock"), new_hosts);
+        retired.values().for_each(|host| host.retire());
         *self.last_synced_sha.lock().expect("sync sha") = Some(sha.clone());
         tracing::info!(
             tenant = %self.id, commit = %sha, agents = tree.agents.len(),
@@ -852,7 +853,8 @@ impl TenantRuntime {
     /// Unmount an agent host. Caller must hold `edit_lock` to serialize against
     /// concurrent edits/creates.
     pub(crate) fn remove_host(&self, agent_id: &str) {
-        self.hosts.write().expect("hosts lock").remove(agent_id);
+        let removed = self.hosts.write().expect("hosts lock").remove(agent_id);
+        removed.iter().for_each(|host| host.retire());
     }
 
     /// Reload every playbook from the store and hot-swap the catalog — called
@@ -883,10 +885,12 @@ impl TenantRuntime {
             .await
             .wrap_err("rebuilding agent host")?;
         self.config_store.upsert(&agent).await?;
-        self.hosts
+        let replaced = self
+            .hosts
             .write()
             .expect("hosts lock")
             .insert(agent.id.clone(), Arc::new(host));
+        replaced.iter().for_each(|host| host.retire());
         Ok(())
     }
 }
@@ -1005,6 +1009,7 @@ mod tests {
                     mcp: Some(McpSettings {
                         url: "http://127.0.0.1:1/mcp".into(),
                         discovery_credential: None,
+                        ..Default::default()
                     }),
                     ..Default::default()
                 },
@@ -1029,6 +1034,60 @@ mod tests {
                 .expect("a private tenant defers discovery to the first turn");
             assert_eq!(runtime.outbound(), OutboundPolicy::Private);
             assert!(runtime.host("support").is_some());
+        })
+        .await;
+    }
+
+    /// The same build-time refusal for an additional server: a `public`
+    /// tenant refuses a loopback `http` one even when the primary is a public
+    /// https address, and the error names the server.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_public_tenant_refuses_a_private_additional_mcp_server_at_build() {
+        use crate::agent::{EmbedSettings, McpServerSettings, McpSettings};
+        use crate::analytics::run_edge_analytics_migrations;
+        use crate::tenant::run_edge_migrations;
+        use workforce_common::session_postgres::{run_session_migrations, PostgresSessionStore};
+        use workforce_postgres::test_support::with_test_pool;
+
+        with_test_pool(PostgresSessionStore::build_pool, |pool| async move {
+            run_session_migrations(&pool).await.unwrap();
+            run_edge_analytics_migrations(&pool).await.unwrap();
+            run_edge_migrations(&pool).await.unwrap();
+            let infra = SharedInfra::for_tests_on(pool);
+            let agent = EdgeAgent {
+                id: "northwind-help".into(),
+                embed: EmbedSettings {
+                    mcp: Some(McpSettings {
+                        url: "https://93.184.216.34/mcp".into(),
+                        ..Default::default()
+                    }),
+                    mcp_servers: vec![McpServerSettings {
+                        id: "docs".into(),
+                        connection: McpSettings {
+                            url: "http://127.0.0.1:2/mcp".into(),
+                            ..Default::default()
+                        },
+                        tool_prefix: Some("docs".into()),
+                        allowed_tools: vec!["docs.*".into()],
+                        tool_grants: vec![],
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let settings = TenantSettings {
+                seed_agents: vec![agent],
+                outbound: OutboundPolicy::Public,
+                ..settings("default")
+            };
+            let Err(err) = TenantRuntime::build(settings, &infra).await else {
+                panic!("a public tenant must refuse a loopback http additional server");
+            };
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("refusing MCP url") && message.contains("for server docs"),
+                "{message}"
+            );
         })
         .await;
     }

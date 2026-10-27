@@ -29,7 +29,9 @@ use workforce_agent::artifacts::disposition::content_disposition_attachment;
 use workforce_agent::artifacts::{ArtifactBody, ArtifactId, ArtifactStore, ContentType};
 use workforce_agent::llm::provider::ProviderKind;
 
-use crate::agent::{EdgeAgent, EmbedSettings};
+use crate::agent::{
+    EdgeAgent, EmbedSettings, McpAuth, McpServerSettings, McpServerSpec, McpSettings, ToolGrant,
+};
 use crate::boot::SharedInfra;
 use crate::config::{EdgeConfig, GitConfig};
 use crate::git_config::{self, Expansion};
@@ -78,6 +80,9 @@ pub struct EdgeState {
     /// The platform surface, when `[platform]` is set; `None` leaves every
     /// `/platform` route 404.
     platform: Option<Arc<crate::platform::PlatformState>>,
+    /// The `/metrics` route, when `[metrics]` is enabled; `None` leaves it
+    /// unmounted.
+    metrics: Option<Arc<crate::metrics::MetricsEndpoint>>,
 }
 
 /// Requests per minute one address may send to hosts that name no served
@@ -114,6 +119,8 @@ impl EdgeState {
             .transpose()
             .wrap_err("building the platform surface")?
             .map(Arc::new);
+        let metrics =
+            crate::metrics::MetricsEndpoint::from_config(config.metrics.as_ref())?.map(Arc::new);
         if platform.is_some() && !config.server.multi_tenant {
             tracing::warn!(
                 "[platform] is set without server.multi_tenant: the platform API can manage the \
@@ -136,6 +143,7 @@ impl EdgeState {
             unresolved_limiter: RateLimiter::new(UNRESOLVED_PER_MIN, Duration::from_secs(60)),
             shutdown: CancellationToken::new(),
             platform,
+            metrics,
         };
         match &state.mode {
             TenantMode::Single(id) => {
@@ -614,6 +622,9 @@ impl EdgeState {
             .transpose()
             .expect("a valid test [platform]")
             .map(Arc::new);
+        let metrics = crate::metrics::MetricsEndpoint::from_config(config.metrics.as_ref())
+            .expect("a valid test [metrics]")
+            .map(Arc::new);
         let state = Self {
             infra,
             tenants: std::sync::RwLock::new(HashMap::new()),
@@ -626,6 +637,7 @@ impl EdgeState {
             unresolved_limiter: RateLimiter::new(UNRESOLVED_PER_MIN, Duration::from_secs(60)),
             shutdown: CancellationToken::new(),
             platform,
+            metrics,
         };
         for (runtime, hostnames) in tenants {
             for host in hostnames {
@@ -3529,7 +3541,7 @@ async fn admin_operator_delete(
 }
 
 /// `GET /admin/api/agents` — the editable agent config. Returns everything the
-/// edit form needs (incl. system_prompt + branding) but NEVER the MCP
+/// edit form needs (incl. system_prompt + branding) but NEVER an MCP
 /// `discovery_credential`: a secret that must not reach the browser, shown
 /// only as `has_discovery_credential`. Guarded by `admin_guard`.
 async fn admin_agents(ServedTenant(tenant): ServedTenant) -> Response {
@@ -3538,6 +3550,12 @@ async fn admin_agents(ServedTenant(tenant): ServedTenant) -> Response {
         .iter()
         .map(|h| {
             let a = h.agent();
+            let servers: Vec<serde_json::Value> =
+                a.embed.mcp_server_specs().iter().map(server_view).collect();
+            let (mcp_settings, mcp_servers) = match servers.split_first() {
+                Some((primary, additional)) => (Some(primary.clone()), additional.to_vec()),
+                None => (None, Vec::new()),
+            };
             serde_json::json!({
                 "id": a.id,
                 "display_name": a.display_name,
@@ -3565,7 +3583,13 @@ async fn admin_agents(ServedTenant(tenant): ServedTenant) -> Response {
                 "drawing": a.embed.drawing == Some(true),
                 "has_mcp": a.embed.mcp.is_some(),
                 "mcp_url": a.embed.mcp.as_ref().map(|m| m.url.clone()),
-                "has_discovery_credential": has_discovery_credential(&a.embed),
+                "has_discovery_credential": a
+                    .embed
+                    .mcp
+                    .as_ref()
+                    .is_some_and(McpSettings::has_discovery_credential),
+                "mcp_settings": mcp_settings,
+                "mcp_servers": mcp_servers,
                 "permissions": a.embed.permissions,
                 "tool_grants": a.embed.tool_grants,
                 "policy": a.embed.policy,
@@ -3584,16 +3608,31 @@ async fn admin_agents(ServedTenant(tenant): ServedTenant) -> Response {
     axum::Json(serde_json::json!({ "agents": agents })).into_response()
 }
 
-/// Snapshot the live agent as a revision, with the MCP `discovery_credential`
+/// One MCP server as the editor shows it, with its effective defaults and never
+/// its credential.
+fn server_view(spec: &McpServerSpec<'_>) -> serde_json::Value {
+    serde_json::json!({
+        "id": spec.id,
+        "url": spec.connection.url,
+        "auth": spec.connection.auth,
+        "audience": spec.connection.audience,
+        "required": spec.required,
+        "unavailable_skip_secs": spec.unavailable_skip().as_secs(),
+        "has_discovery_credential": spec.connection.has_discovery_credential(),
+        "tool_prefix": spec.tool_prefix,
+        "allowed_tools": spec.tools.allowed_tools,
+        "tool_grants": spec.tools.tool_grants,
+    })
+}
+
+/// Snapshot the live agent as a revision, with every MCP `discovery_credential`
 /// stripped — a secret must never land in a revision (which the GET-revision
-/// endpoint hands to the browser). Restore preserves the live MCP block, so
-/// fidelity isn't lost. Best-effort.
+/// endpoint hands to the browser). Restore re-attaches the live credentials,
+/// so fidelity isn't lost. Best-effort.
 async fn snapshot_agent(tenant: &TenantRuntime, id: &str, operator: &str) {
     let Some(host) = tenant.host(id) else { return };
     let mut snap = host.agent().as_ref().clone();
-    if let Some(mcp) = snap.embed.mcp.as_mut() {
-        mcp.discovery_credential = None;
-    }
+    snap.embed.strip_credentials();
     if let Ok(json) = serde_json::to_string(&snap) {
         tenant.revisions.record("agent", id, &json, operator).await;
     }
@@ -3633,10 +3672,13 @@ struct AgentEdit {
     uploads: Option<Vec<crate::agent::UploadKind>>,
     upload_max_mb: Option<u32>,
     drawing: Option<bool>,
-    /// The company MCP server. Absent ⇒ unchanged; `null` or a blank `url` ⇒
-    /// no MCP (a pure-chat agent).
+    /// The primary company MCP server. Absent ⇒ unchanged; `null` or a blank
+    /// `url` ⇒ no MCP (a pure-chat agent).
     #[serde(default, deserialize_with = "double_option")]
     mcp: Option<Option<McpEdit>>,
+    /// The additional MCP servers, as the whole list. Absent ⇒ unchanged, so a
+    /// client that predates them never wipes them; `[]` removes them all.
+    mcp_servers: Option<Vec<McpServerEdit>>,
     /// Where `backend_permissions` grants are resolved. `null` removes it.
     #[serde(default, deserialize_with = "double_option")]
     permissions: Option<Option<crate::agent::PermissionsConfig>>,
@@ -3649,15 +3691,26 @@ struct AgentEdit {
     passive_memory: Option<bool>,
 }
 
-/// The MCP block as an edit or create body carries it. The credential is
-/// write-only: absent or `null` keeps the stored one, the empty string clears
-/// it, anything else replaces it.
+/// An MCP server's connection as an edit or create body carries it, under
+/// [`edited`]'s rule: absent keeps the stored value, `null` resets it to the
+/// default, anything else replaces it. A blank `url` is that default: no
+/// primary server, and a refused additional one. The credential is
+/// write-only, so `null` keeps it as absence does and the empty string clears
+/// it.
 #[derive(Deserialize)]
 struct McpEdit {
-    #[serde(default)]
-    url: String,
+    #[serde(default, deserialize_with = "double_option")]
+    url: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     discovery_credential: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    auth: Option<Option<McpAuth>>,
+    #[serde(default, deserialize_with = "double_option")]
+    audience: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    required: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "double_option")]
+    unavailable_skip_secs: Option<Option<u64>>,
 }
 
 /// Manual `Debug` so a logged edit body can never print the credential.
@@ -3672,42 +3725,91 @@ impl std::fmt::Debug for McpEdit {
                     .as_ref()
                     .map(|c| c.as_ref().map(|_| "<redacted>")),
             )
+            .field("auth", &self.auth)
+            .field("audience", &self.audience)
+            .field("required", &self.required)
+            .field("unavailable_skip_secs", &self.unavailable_skip_secs)
             .finish()
     }
 }
 
 impl McpEdit {
-    /// The settings this edit yields over `current` (the agent's MCP before
-    /// the edit): `None` for a blank URL, else the URL with the credential
-    /// the body asked for, or the current one when it said nothing.
-    fn resolve(
-        self,
-        current: Option<crate::agent::McpSettings>,
-    ) -> Option<crate::agent::McpSettings> {
-        let url = self.url.trim();
-        if url.is_empty() {
-            return None;
+    /// The primary server this edit yields over `current` (the agent's MCP
+    /// before the edit): [`Self::over`] it, `None` when that leaves no URL.
+    fn resolve(self, current: Option<McpSettings>) -> Option<McpSettings> {
+        Some(self.over(current.unwrap_or_default())).filter(|mcp| !mcp.url.is_empty())
+    }
+
+    /// The connection this edit yields over `current`.
+    fn over(self, current: McpSettings) -> McpSettings {
+        McpSettings {
+            url: edited(self.url, current.url).trim().to_string(),
+            discovery_credential: resolve_credential(
+                self.discovery_credential,
+                current.discovery_credential,
+            ),
+            auth: edited(self.auth, current.auth),
+            audience: self.audience.unwrap_or(current.audience),
+            required: self.required.unwrap_or(current.required),
+            unavailable_skip_secs: self
+                .unavailable_skip_secs
+                .unwrap_or(current.unavailable_skip_secs),
         }
-        let kept = current.and_then(|m| m.discovery_credential);
-        let discovery_credential = match self.discovery_credential {
-            None | Some(None) => kept,
-            Some(Some(c)) => Some(c.trim().to_string()).filter(|c| !c.is_empty()),
-        };
-        Some(crate::agent::McpSettings {
-            url: url.to_string(),
-            discovery_credential,
-        })
     }
 }
 
-/// Whether the agent's MCP carries a discovery credential — what the admin
-/// is shown in place of the credential itself.
-fn has_discovery_credential(embed: &EmbedSettings) -> bool {
-    embed
-        .mcp
-        .as_ref()
-        .and_then(|m| m.discovery_credential.as_deref())
-        .is_some_and(|c| !c.is_empty())
+/// The edit rule every field of an MCP server follows: absent keeps `kept`,
+/// `null` resets to the default, a value replaces it. An `Option` field needs
+/// no helper: its default is `None`, so `edit.unwrap_or(kept)` is the rule.
+fn edited<T: Default>(edit: Option<Option<T>>, kept: T) -> T {
+    edit.map_or(kept, Option::unwrap_or_default)
+}
+
+/// The write-only credential rule: absent or `null` keeps `kept`, the empty
+/// string clears it, anything else replaces it.
+fn resolve_credential(edit: Option<Option<String>>, kept: Option<String>) -> Option<String> {
+    match edit {
+        None | Some(None) => kept,
+        Some(Some(c)) => Some(c.trim().to_string()).filter(|c| !c.is_empty()),
+    }
+}
+
+/// An additional MCP server as an edit or create body carries it: its
+/// connection plus its own tool lists, every field under [`edited`]'s rule.
+#[derive(Debug, Deserialize)]
+struct McpServerEdit {
+    #[serde(default)]
+    id: String,
+    #[serde(flatten)]
+    connection: McpEdit,
+    #[serde(default, deserialize_with = "double_option")]
+    tool_prefix: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    allowed_tools: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "double_option")]
+    tool_grants: Option<Option<Vec<ToolGrant>>>,
+}
+
+impl McpServerEdit {
+    /// The server this edit yields over `current` (the agent's servers before
+    /// the edit). What a field keeps comes from the server with the same id,
+    /// so a new or renamed server starts from the defaults: no URL (refused
+    /// by validation), no credential, no tools.
+    fn resolve(self, current: &[McpServerSettings]) -> McpServerSettings {
+        let id = self.id.trim().to_string();
+        let kept = current
+            .iter()
+            .find(|s| s.id == id)
+            .cloned()
+            .unwrap_or_default();
+        McpServerSettings {
+            connection: self.connection.over(kept.connection),
+            id,
+            tool_prefix: self.tool_prefix.unwrap_or(kept.tool_prefix),
+            allowed_tools: edited(self.allowed_tools, kept.allowed_tools),
+            tool_grants: edited(self.tool_grants, kept.tool_grants),
+        }
+    }
 }
 
 /// Normalise the integration slice of an embed the way the editor means it:
@@ -3715,20 +3817,50 @@ fn has_discovery_credential(embed: &EmbedSettings) -> bool {
 /// matcher is case-insensitive, so the stored form may as well be canonical).
 fn tidy_embed(embed: &mut EmbedSettings) {
     if let Some(mcp) = embed.mcp.as_mut() {
-        mcp.url = mcp.url.trim().to_string();
+        tidy_connection(mcp, true);
+    }
+    for server in &mut embed.mcp_servers {
+        server.id = server.id.trim().to_string();
+        tidy_connection(&mut server.connection, false);
+        server.tool_prefix = server
+            .tool_prefix
+            .take()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
+        server.allowed_tools = tidy_names(std::mem::take(&mut server.allowed_tools));
+        tidy_grants(&mut server.tool_grants);
     }
     if let Some(p) = embed.permissions.as_mut() {
         p.url = p.url.trim().to_string();
     }
-    for grant in &mut embed.tool_grants {
-        grant.requires = grant.requires.trim().to_string();
-        grant.tools = tidy_names(std::mem::take(&mut grant.tools));
-    }
+    tidy_grants(&mut embed.tool_grants);
     embed.image_hosts = tidy_names(std::mem::take(&mut embed.image_hosts))
         .into_iter()
         .map(|h| h.to_ascii_lowercase())
         .collect();
     embed.spill_skip_tools = tidy_names(std::mem::take(&mut embed.spill_skip_tools));
+}
+
+/// Trim a connection and drop every option set to its default, so a save that
+/// changes nothing stores exactly what was there.
+fn tidy_connection(connection: &mut McpSettings, required_by_default: bool) {
+    connection.url = connection.url.trim().to_string();
+    connection.audience = connection
+        .audience
+        .take()
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty());
+    connection.required = connection.required.filter(|r| *r != required_by_default);
+    connection.unavailable_skip_secs = connection
+        .unavailable_skip_secs
+        .filter(|secs| *secs != crate::agent::DEFAULT_UNAVAILABLE_SKIP_SECS);
+}
+
+fn tidy_grants(grants: &mut [ToolGrant]) {
+    for grant in grants {
+        grant.requires = grant.requires.trim().to_string();
+        grant.tools = tidy_names(std::mem::take(&mut grant.tools));
+    }
 }
 
 fn tidy_names(names: Vec<String>) -> Vec<String> {
@@ -3745,6 +3877,10 @@ fn tidy_names(names: Vec<String>) -> Vec<String> {
 #[derive(Clone, Copy, Default)]
 struct EmbedChecks {
     mcp: bool,
+    /// The servers' static rules: additional servers' URLs, and everything
+    /// [`EmbedSettings::check_mcp_servers`] checks — which the primary, the
+    /// allowlist and the grants all feed.
+    mcp_servers: bool,
     permissions: bool,
     tool_grants: bool,
     image_hosts: bool,
@@ -3756,6 +3892,7 @@ struct EmbedChecks {
 impl EmbedChecks {
     const ALL: Self = Self {
         mcp: true,
+        mcp_servers: true,
         permissions: true,
         tool_grants: true,
         image_hosts: true,
@@ -3765,12 +3902,17 @@ impl EmbedChecks {
     fn for_edit(edit: &AgentEdit) -> Self {
         Self {
             mcp: edit.mcp.is_some(),
+            mcp_servers: edit.mcp_servers.is_some()
+                || edit.mcp.is_some()
+                || edit.allowed_tools.is_some()
+                || edit.tool_grants.is_some(),
             permissions: edit.permissions.is_some(),
             tool_grants: edit.tool_grants.is_some(),
             image_hosts: edit.image_hosts.is_some(),
             spill_skip_tools: edit.spill_skip_tools.is_some()
                 || edit.allowed_tools.is_some()
-                || edit.tool_grants.is_some(),
+                || edit.tool_grants.is_some()
+                || edit.mcp_servers.is_some(),
         }
     }
 }
@@ -3782,12 +3924,17 @@ impl EmbedChecks {
 fn validate_embed(embed: &EmbedSettings, checks: EmbedChecks) -> std::result::Result<(), String> {
     if checks.mcp {
         if let Some(mcp) = &embed.mcp {
-            let url =
-                url::Url::parse(&mcp.url).map_err(|e| format!("mcp.url is not a URL: {e}"))?;
-            if !matches!(url.scheme(), "http" | "https") {
-                return Err("mcp.url must be an http(s) URL".to_string());
-            }
+            check_mcp_url("mcp.url", &mcp.url)?;
         }
+    }
+    if checks.mcp_servers {
+        embed.mcp_servers.iter().try_for_each(|s| {
+            check_mcp_url(&format!("mcp_servers[{}].url", s.id), &s.connection.url)
+        })?;
+        embed.check_mcp_servers().map_err(|e| {
+            crate::metrics::config_refused(e.reason);
+            e.message
+        })?;
     }
     if checks.permissions {
         if let Some(p) = &embed.permissions {
@@ -3802,14 +3949,7 @@ fn validate_embed(embed: &EmbedSettings, checks: EmbedChecks) -> std::result::Re
         }
     }
     if checks.tool_grants {
-        for (i, grant) in embed.tool_grants.iter().enumerate() {
-            if grant.requires.is_empty() {
-                return Err(format!("tool_grants[{i}] needs the capability it requires"));
-            }
-            if grant.tools.is_empty() {
-                return Err(format!("tool_grants[{i}] must unlock at least one tool"));
-            }
-        }
+        crate::agent::check_tool_grants("tool_grants", &embed.tool_grants)?;
     }
     if checks.image_hosts {
         if let Some(host) = embed.image_hosts.iter().find(|h| !valid_image_host(h)) {
@@ -3832,6 +3972,19 @@ fn validate_embed(embed: &EmbedSettings, checks: EmbedChecks) -> std::result::Re
     Ok(())
 }
 
+/// An MCP URL's shape: present, parseable, and http(s).
+fn check_mcp_url(field: &str, url: &str) -> std::result::Result<(), String> {
+    if url.is_empty() {
+        return Err(format!("{field} is required"));
+    }
+    let parsed = url::Url::parse(url).map_err(|e| format!("{field} is not a URL: {e}"))?;
+    if matches!(parsed.scheme(), "http" | "https") {
+        Ok(())
+    } else {
+        Err(format!("{field} must be an http(s) URL"))
+    }
+}
+
 /// A bare hostname as `image_hosts` holds it: lowercase DNS labels, optionally
 /// with the leading dot that admits subdomains. No scheme, port or path.
 fn valid_image_host(host: &str) -> bool {
@@ -3850,11 +4003,11 @@ fn valid_image_host(host: &str) -> bool {
 }
 
 /// Whether a `spill_skip_tools` entry names something the agent can call: a
-/// tool the allowlist admits (exactly or by glob), or a granted tool it names
-/// exactly or as the prefix the spill matcher accepts.
+/// tool some server's allowlist admits (exactly or by glob), or a granted tool
+/// it names exactly or as the prefix the spill matcher accepts.
 fn spill_entry_covered(embed: &EmbedSettings, entry: &str) -> bool {
-    embed.tool_allowed(entry)
-        || embed.tool_grants.iter().flat_map(|g| &g.tools).any(|t| {
+    embed.any_server_admits(entry)
+        || embed.all_tool_grants().flat_map(|g| &g.tools).any(|t| {
             t == entry || t.starts_with(&format!("{entry}.")) || t.starts_with(&format!("{entry}_"))
         })
 }
@@ -3966,6 +4119,10 @@ fn apply_edit(agent: &mut EdgeAgent, edit: AgentEdit) {
     if let Some(v) = edit.mcp {
         let current = agent.embed.mcp.take();
         agent.embed.mcp = v.and_then(|m| m.resolve(current));
+    }
+    if let Some(v) = edit.mcp_servers {
+        let current = std::mem::take(&mut agent.embed.mcp_servers);
+        agent.embed.mcp_servers = v.into_iter().map(|m| m.resolve(&current)).collect();
     }
     if let Some(v) = edit.permissions {
         agent.embed.permissions = v;
@@ -4211,7 +4368,7 @@ async fn admin_import_git(
     let playbook_ids: std::collections::HashSet<&str> =
         tree.playbooks.iter().map(|(id, _)| id.as_str()).collect();
     for agent in &mut agents {
-        if !valid_agent_id(&agent.id) {
+        if !crate::agent::valid_id(&agent.id) {
             return unprocessable(format!(
                 "agent {:?}: id must be 1–64 chars of lowercase letters, digits, or dashes",
                 agent.id
@@ -4289,9 +4446,7 @@ async fn admin_import_git(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
             let mut snapshot = agent.clone();
-            if let Some(mcp) = snapshot.embed.mcp.as_mut() {
-                mcp.discovery_credential = None;
-            }
+            snapshot.embed.strip_credentials();
             if let Ok(json) = serde_json::to_string(&snapshot) {
                 tenant
                     .revisions
@@ -4375,6 +4530,8 @@ struct AgentCreate {
     #[serde(default)]
     mcp: Option<McpEdit>,
     #[serde(default)]
+    mcp_servers: Vec<McpServerEdit>,
+    #[serde(default)]
     branding: crate::agent::Branding,
     #[serde(default)]
     data_tables: Option<bool>,
@@ -4412,16 +4569,6 @@ struct AgentCreate {
     passive_memory: Option<bool>,
 }
 
-/// A slug-safe agent id: lowercase letters, digits, and dashes, 1..64 chars. The
-/// id is a session namespace + Weaviate owner scope, so it must be stable + tidy.
-fn valid_agent_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
 /// `POST /admin/api/agents` — create a new agent. Validates the id + required
 /// fields, builds and hot-mounts its host, then persists. Guarded.
 async fn admin_agent_create(
@@ -4440,7 +4587,7 @@ async fn admin_agent_create(
         )
             .into_response()
     };
-    if !valid_agent_id(&c.id) {
+    if !crate::agent::valid_id(&c.id) {
         return fail("id must be 1–64 chars of lowercase letters, digits, or dashes");
     }
     if c.display_name.trim().is_empty() {
@@ -4492,6 +4639,7 @@ async fn admin_agent_create(
                 .filter(|s| !s.is_empty()),
             allowed_emails: c.allowed_emails,
             mcp: c.mcp.and_then(|m| m.resolve(None)),
+            mcp_servers: c.mcp_servers.into_iter().map(|m| m.resolve(&[])).collect(),
             branding: c.branding,
             passive_memory: c.passive_memory,
             data_tables: c.data_tables,
@@ -5691,12 +5839,7 @@ async fn admin_revision_restore(
             // nor sends it to a server it was not set for.
             Ok(mut agent) if agent.id == item => match tenant.host(&item) {
                 Some(h) => {
-                    let live = h.agent().embed.mcp.clone();
-                    if let Some(mcp) = agent.embed.mcp.as_mut() {
-                        mcp.discovery_credential = live
-                            .filter(|l| l.url == mcp.url)
-                            .and_then(|l| l.discovery_credential);
-                    }
+                    agent.embed.adopt_credentials(&h.agent().embed);
                     // We already hold edit_lock — use the lock-free inner or we
                     // would deadlock re-taking the non-reentrant lock.
                     tenant.apply_agent_edit_inner(agent).await.map_err(|e| {
@@ -6008,9 +6151,14 @@ pub fn router(state: Arc<EdgeState>) -> Router {
             Arc::clone(&state),
             admin_guard,
         ));
+    let metrics = state
+        .metrics
+        .clone()
+        .map_or_else(Router::new, crate::metrics::router);
     Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
+        .merge(metrics)
         .route("/admin/api/login", axum::routing::post(admin_login))
         .route(
             "/admin/api/login/oidc",
@@ -6175,6 +6323,7 @@ mod tests {
                 mcp: Some(crate::agent::McpSettings {
                     url: "http://mcp".into(),
                     discovery_credential: Some("SECRET".into()),
+                    ..Default::default()
                 }),
                 allowed_origins: vec!["https://old".into()],
                 ..Default::default()
@@ -6451,6 +6600,7 @@ mod tests {
             keycloak_issuer: "https://kc".into(),
             keycloak_audience: None,
             mcp: None::<McpSettings>,
+            mcp_servers: vec![],
             branding: Branding::default(),
             passive_memory: None,
             data_tables: None,
@@ -7050,6 +7200,56 @@ mod tenant_tests {
             .await
             .unwrap();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// `/metrics` is mounted only when `[metrics]` is enabled, and then
+    /// answers only a scraper presenting the configured bearer token.
+    #[tokio::test]
+    async fn the_metrics_endpoint_is_bearer_guarded_and_absent_when_disabled() {
+        const TOKEN: &str = "metrics-scrape-token-0123456789abcdef";
+        let state_with = |metrics: Option<crate::metrics::MetricsConfig>| {
+            let mut cfg = edge_toml();
+            cfg.metrics = metrics;
+            EdgeState::for_tests(
+                TenantMode::Single(TenantId::default_tenant()),
+                vec![],
+                Arc::new(SharedInfra::for_tests()),
+                cfg,
+                1,
+            )
+        };
+        let scrape = |token: Option<&str>| {
+            let mut req = Request::builder().method(Method::GET).uri("/metrics");
+            if let Some(token) = token {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            req.extension(peer("203.0.113.1"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let enabled = state_with(Some(crate::metrics::MetricsConfig {
+            enabled: true,
+            bearer_token: Some(TOKEN.into()),
+        }));
+        for refused in [None, Some("wrong-token-wrong-token-wrong-token")] {
+            let (status, body) = send(&enabled, scrape(refused)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{refused:?}");
+            assert!(body.is_empty(), "{body}");
+        }
+        let (status, _) = send(&enabled, scrape(Some(TOKEN))).await;
+        assert_eq!(status, StatusCode::OK);
+
+        for disabled in [
+            None,
+            Some(crate::metrics::MetricsConfig {
+                enabled: false,
+                bearer_token: Some(TOKEN.into()),
+            }),
+        ] {
+            let (status, _) = send(&state_with(disabled), scrape(Some(TOKEN))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "not routed when disabled");
+        }
     }
 
     #[tokio::test]
@@ -9045,6 +9245,420 @@ mod tenant_tests {
         .await;
     }
 
+    /// Additional servers through the admin API: listed without credentials,
+    /// kept by an edit that does not name them, write-only credentials per
+    /// id, normalised so an untouched save stores the same config, refused
+    /// when orphaned, covered by the spill list, and stripped from revisions
+    /// with restore re-attaching only what still points where it did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn additional_mcp_servers_round_trip_through_the_admin_api() {
+        use workforce_common::session_postgres::PostgresSessionStore;
+        use workforce_postgres::test_support::with_test_pool;
+
+        with_test_pool(PostgresSessionStore::build_pool, |pool| async move {
+            let (state, runtime, cookie) = agent_fixture(pool, None).await;
+            let primary = crate::mcp::tests::mock_mcp(&["acme.list_orders"]).await;
+            let docs = crate::mcp::tests::mock_mcp(&["search", "edit_page"]).await;
+            let billing = crate::mcp::tests::mock_mcp(&["billing.list_invoices"]).await;
+            let docs_url = format!("{}/mcp", docs.uri());
+            const DOCS_SECRET: &str = "docs-svc-71ab";
+            let put = |body: Value| {
+                let state = Arc::clone(&state);
+                let cookie = cookie.clone();
+                async move {
+                    send(
+                        &state,
+                        request(Method::PUT, "/admin/api/agents/support", &cookie, Some(body)),
+                    )
+                    .await
+                }
+            };
+            let stored = || async { runtime.config_store.load_all().await.unwrap().remove(0) };
+            let credential_of = |agent: &EdgeAgent, id: &str| {
+                agent
+                    .embed
+                    .mcp_servers
+                    .iter()
+                    .find(|s| s.id == id)
+                    .and_then(|s| s.connection.discovery_credential.clone())
+            };
+
+            let (status, body) = put(serde_json::json!({
+                "mcp": {"url": format!("{}/mcp", primary.uri()), "required": true},
+                "mcp_servers": [
+                    {"id": " docs ", "url": format!(" {docs_url} "), "tool_prefix": "docs",
+                     "audience": " ", "unavailable_skip_secs": 60, "required": false,
+                     "allowed_tools": ["docs.search", " "], "discovery_credential": DOCS_SECRET,
+                     "tool_grants": [{"source": "keycloak_role", "requires": "editor", "tools": ["docs.edit_page"]}]},
+                    {"id": "billing", "url": format!("{}/mcp", billing.uri()), "auth": "forwarded",
+                     "allowed_tools": ["billing.*"]},
+                ],
+                "spill_skip_tools": ["docs.search"],
+            }))
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+
+            let (agent, listing) = listed_agent(&state, &cookie, "support").await;
+            assert!(!listing.contains(DOCS_SECRET), "{listing}");
+            assert_eq!(
+                agent["mcp_servers"],
+                serde_json::json!([
+                    {"id": "docs", "url": docs_url, "auth": "exchanged", "audience": null,
+                     "required": false, "unavailable_skip_secs": 60, "has_discovery_credential": true,
+                     "tool_prefix": "docs", "allowed_tools": ["docs.search"],
+                     "tool_grants": [{"source": "keycloak_role", "requires": "editor", "tools": ["docs.edit_page"]}]},
+                    {"id": "billing", "url": format!("{}/mcp", billing.uri()), "auth": "forwarded",
+                     "audience": null, "required": false, "unavailable_skip_secs": 60,
+                     "has_discovery_credential": false, "tool_prefix": null,
+                     "allowed_tools": ["billing.*"], "tool_grants": []},
+                ])
+            );
+            assert_eq!(agent["mcp_settings"]["required"], true);
+            assert_eq!(agent["mcp_settings"]["id"], "default");
+            let saved = stored().await;
+            let raw = serde_json::to_value(&saved.embed).unwrap();
+            assert_eq!(
+                raw["mcp"],
+                serde_json::json!({"url": format!("{}/mcp", primary.uri()), "discovery_credential": null}),
+                "defaults are normalised away, so the primary stores as before"
+            );
+            assert!(raw["mcp_servers"][0].get("required").is_none(), "{raw}");
+            assert!(raw["mcp_servers"][0].get("unavailable_skip_secs").is_none(), "{raw}");
+            assert_eq!(credential_of(&saved, "docs").as_deref(), Some(DOCS_SECRET));
+
+            // What the editor sends back unchanged stores exactly what was there.
+            let echo = |view: &Value| {
+                let mut view = view.as_object().unwrap().clone();
+                view.remove("has_discovery_credential");
+                Value::Object(view)
+            };
+            let untouched = serde_json::json!({
+                "mcp": echo(&agent["mcp_settings"]),
+                "mcp_servers": agent["mcp_servers"].as_array().unwrap().iter().map(echo).collect::<Vec<_>>(),
+                "allowed_tools": agent["allowed_tools"],
+                "tool_grants": agent["tool_grants"],
+            });
+            let (status, body) = put(untouched).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                serde_json::to_value(stored().await).unwrap(),
+                serde_json::to_value(&saved).unwrap(),
+                "an untouched save is byte-for-byte the stored config"
+            );
+
+            // A body that predates additional servers, or edits only the
+            // primary, leaves them and their credentials alone.
+            for body in [
+                serde_json::json!({"welcome": "hi"}),
+                serde_json::json!({"mcp": {"url": format!("{}/mcp", primary.uri())}}),
+            ] {
+                let (status, response) = put(body).await;
+                assert_eq!(status, StatusCode::OK, "{response}");
+                let kept = stored().await;
+                assert_eq!(kept.embed.mcp_servers.len(), 2);
+                assert_eq!(credential_of(&kept, "docs").as_deref(), Some(DOCS_SECRET));
+            }
+
+            let docs_row = |credential: Option<&str>, id: &str| {
+                let mut row = serde_json::json!({"id": id, "url": docs_url, "tool_prefix": "docs",
+                    "allowed_tools": ["docs.search"]});
+                if let Some(c) = credential {
+                    row["discovery_credential"] = c.into();
+                }
+                serde_json::json!({"mcp_servers": [row]})
+            };
+            let (status, body) = put(docs_row(None, "docs")).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                credential_of(&stored().await, "docs").as_deref(),
+                Some(DOCS_SECRET),
+                "absent keeps"
+            );
+            put(docs_row(Some("docs-svc-2"), "docs")).await;
+            assert_eq!(
+                credential_of(&stored().await, "docs").as_deref(),
+                Some("docs-svc-2"),
+                "a new value replaces"
+            );
+            put(docs_row(Some(""), "docs")).await;
+            assert_eq!(credential_of(&stored().await, "docs"), None, "empty clears");
+            put(docs_row(Some("docs-svc-3"), "docs")).await;
+            put(docs_row(None, "pages")).await;
+            assert_eq!(
+                credential_of(&stored().await, "pages"),
+                None,
+                "a renamed server starts with no credential"
+            );
+
+            // The primary cannot be cleared from under its servers.
+            let (status, body) = put(serde_json::json!({"mcp": null})).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert!(body.contains("need the primary server"), "{body}");
+
+            // Revisions never hold a credential; restore re-attaches the live
+            // one only where the server still points where it did.
+            put(docs_row(Some(DOCS_SECRET), "docs")).await;
+            let revisions = runtime.revisions.list("agent", "support").await.unwrap();
+            let latest = revisions[0].revision;
+            let content = runtime
+                .revisions
+                .get("agent", "support", latest)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(content.contains(&docs_url) && !content.contains(DOCS_SECRET), "{content}");
+            let moved = format!("{}/moved", docs.uri());
+            put(serde_json::json!({"mcp_servers": [{"id": "docs", "url": moved,
+                "tool_prefix": "docs", "allowed_tools": ["docs.search"]}]}))
+            .await;
+            let restore = |revision: i32| {
+                let state = Arc::clone(&state);
+                let cookie = cookie.clone();
+                async move {
+                    send(
+                        &state,
+                        request(
+                            Method::POST,
+                            &format!("/admin/api/revisions/agent/support/{revision}/restore"),
+                            &cookie,
+                            None,
+                        ),
+                    )
+                    .await
+                }
+            };
+            let (status, body) = restore(latest).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                credential_of(&stored().await, "docs"),
+                None,
+                "the live credential was set for another URL, so it does not follow"
+            );
+            put(docs_row(Some(DOCS_SECRET), "docs")).await;
+            let (status, body) = restore(latest).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                credential_of(&stored().await, "docs").as_deref(),
+                Some(DOCS_SECRET),
+                "same id, same URL: the live credential is kept"
+            );
+
+            let (status, body) = put(serde_json::json!({"mcp_servers": []})).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert!(
+                body.contains("spill_skip_tools"),
+                "the spill list still names a removed server's tool: {body}"
+            );
+            let (status, body) =
+                put(serde_json::json!({"mcp_servers": [], "spill_skip_tools": []})).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(stored().await.embed.mcp_servers.is_empty(), "[] removes them all");
+        })
+        .await;
+    }
+
+    /// Every field of an additional server's edit follows one rule: absent
+    /// keeps the stored value, `null` resets it to the default (refused where
+    /// the default is not a valid config), a value replaces it. A new id
+    /// starts from the defaults, and one without a URL is refused by name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_mcp_server_field_keeps_when_absent_resets_on_null_and_replaces_when_present() {
+        use workforce_common::session_postgres::PostgresSessionStore;
+        use workforce_postgres::test_support::with_test_pool;
+
+        with_test_pool(PostgresSessionStore::build_pool, |pool| async move {
+            let (state, _runtime, cookie) = agent_fixture(pool, None).await;
+            let primary = crate::mcp::tests::mock_mcp(&["acme.list_orders"]).await;
+            let docs = crate::mcp::tests::mock_mcp(&["search", "edit_page"]).await;
+            let docs_url = format!("{}/mcp", docs.uri());
+            let primary_url = format!("{}/mcp", primary.uri());
+            let put = |body: Value| {
+                let state = Arc::clone(&state);
+                let cookie = cookie.clone();
+                async move {
+                    send(
+                        &state,
+                        request(Method::PUT, "/admin/api/agents/support", &cookie, Some(body)),
+                    )
+                    .await
+                }
+            };
+            let listed = |id: &'static str| {
+                let state = Arc::clone(&state);
+                let cookie = cookie.clone();
+                async move {
+                    let (agent, _) = listed_agent(&state, &cookie, "support").await;
+                    agent["mcp_servers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|s| s["id"] == id)
+                        .cloned()
+                }
+            };
+            let grant = |requires: &str, tool: &str| {
+                serde_json::json!([{"source": "keycloak_role", "requires": requires, "tools": [tool]}])
+            };
+            let merged = |patch: Value| {
+                let mut row = serde_json::json!({
+                    "id": "docs", "url": docs_url, "auth": "exchanged", "audience": "docs-aud",
+                    "required": false, "unavailable_skip_secs": 15, "tool_prefix": "docs",
+                    "allowed_tools": ["docs.search"], "tool_grants": grant("editor", "docs.edit_page"),
+                });
+                row.as_object_mut()
+                    .unwrap()
+                    .extend(patch.as_object().unwrap().clone());
+                row
+            };
+            let (status, body) = put(serde_json::json!({"mcp": {"url": primary_url}})).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+
+            // (stored before, edit, the field it touches, what it reads after)
+            let cases = [
+                (serde_json::json!({}), serde_json::json!({"url": format!("{}/v2", docs.uri())}),
+                    "url", Value::from(format!("{}/v2", docs.uri()))),
+                (serde_json::json!({"audience": null}), serde_json::json!({"auth": "forwarded"}),
+                    "auth", "forwarded".into()),
+                (serde_json::json!({"auth": "forwarded", "audience": null}), serde_json::json!({"auth": null}),
+                    "auth", "exchanged".into()),
+                (serde_json::json!({}), serde_json::json!({"audience": "other-aud"}),
+                    "audience", "other-aud".into()),
+                (serde_json::json!({}), serde_json::json!({"audience": null}), "audience", Value::Null),
+                (serde_json::json!({}), serde_json::json!({"required": true, "unavailable_skip_secs": null}),
+                    "required", true.into()),
+                (serde_json::json!({"required": true, "unavailable_skip_secs": null}),
+                    serde_json::json!({"required": null}), "required", false.into()),
+                (serde_json::json!({}), serde_json::json!({"unavailable_skip_secs": 30}),
+                    "unavailable_skip_secs", 30.into()),
+                (serde_json::json!({}), serde_json::json!({"unavailable_skip_secs": null}),
+                    "unavailable_skip_secs", crate::agent::DEFAULT_UNAVAILABLE_SKIP_SECS.into()),
+                (serde_json::json!({}), serde_json::json!({"tool_prefix": "pages",
+                    "allowed_tools": ["pages.search"], "tool_grants": grant("editor", "pages.edit_page")}),
+                    "tool_prefix", "pages".into()),
+                (serde_json::json!({}), serde_json::json!({"tool_prefix": null, "allowed_tools": ["search"],
+                    "tool_grants": null}), "tool_prefix", Value::Null),
+                (serde_json::json!({}), serde_json::json!({"allowed_tools": ["docs.*"]}),
+                    "allowed_tools", serde_json::json!(["docs.*"])),
+                (serde_json::json!({}), serde_json::json!({"tool_grants": grant("admin", "docs.edit_page")}),
+                    "tool_grants", grant("admin", "docs.edit_page")),
+                (serde_json::json!({}), serde_json::json!({"tool_grants": null}),
+                    "tool_grants", serde_json::json!([])),
+            ];
+            for (before, edit, field, after) in cases {
+                let (status, body) = put(serde_json::json!({"mcp_servers": [merged(before.clone())]})).await;
+                assert_eq!(status, StatusCode::OK, "{before}: {body}");
+                let stored = listed("docs").await.unwrap();
+
+                let (status, body) = put(serde_json::json!({"mcp_servers": [{"id": "docs"}]})).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(listed("docs").await.unwrap(), stored, "a row naming only its id keeps every field");
+
+                let mut row = edit.clone();
+                row["id"] = "docs".into();
+                let (status, body) = put(serde_json::json!({"mcp_servers": [row]})).await;
+                assert_eq!(status, StatusCode::OK, "{edit}: {body}");
+                let now = listed("docs").await.unwrap();
+                assert_eq!(now[field], after, "{edit}");
+                let mut untouched = stored.as_object().unwrap().clone();
+                untouched.retain(|k, _| edit.get(k).is_none());
+                assert!(
+                    untouched.iter().all(|(k, v)| now[k.as_str()] == *v),
+                    "{edit} changed only what it named: {stored} -> {now}"
+                );
+            }
+
+            // A reset whose default is not a valid config is refused by name.
+            put(serde_json::json!({"mcp_servers": [merged(serde_json::json!({}))]})).await;
+            for (edit, message) in [
+                (serde_json::json!({"id": "docs", "url": null}), "mcp_servers[docs].url is required"),
+                (serde_json::json!({"id": "docs", "url": " "}), "mcp_servers[docs].url is required"),
+                (serde_json::json!({"id": "docs", "allowed_tools": null}),
+                    "mcp_servers[docs].allowed_tools must name at least one tool"),
+            ] {
+                let (status, body) = put(serde_json::json!({"mcp_servers": [edit]})).await;
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+                assert!(body.contains(message), "{body}");
+            }
+
+            // A new id starts from the defaults, and needs a URL.
+            let (status, body) = put(serde_json::json!({"mcp_servers": [
+                {"id": "docs"},
+                {"id": "wiki", "tool_prefix": "wiki", "allowed_tools": ["wiki.search"]},
+            ]}))
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert!(body.contains("mcp_servers[wiki].url is required"), "{body}");
+            let (status, body) = put(serde_json::json!({"mcp_servers": [
+                {"id": "docs"},
+                {"id": "wiki", "url": docs_url, "tool_prefix": "wiki", "allowed_tools": ["wiki.search"]},
+            ]}))
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                listed("wiki").await.unwrap(),
+                serde_json::json!({"id": "wiki", "url": docs_url, "auth": "exchanged", "audience": null,
+                    "required": false, "unavailable_skip_secs": crate::agent::DEFAULT_UNAVAILABLE_SKIP_SECS,
+                    "has_discovery_credential": false, "tool_prefix": "wiki",
+                    "allowed_tools": ["wiki.search"], "tool_grants": []})
+            );
+            assert_eq!(listed("docs").await.unwrap()["audience"], "docs-aud");
+
+            // The primary follows the same rule: a body without a URL keeps it.
+            let (status, body) = put(serde_json::json!({"mcp": {"auth": "forwarded"}})).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let (agent, _) = listed_agent(&state, &cookie, "support").await;
+            assert_eq!(agent["mcp_settings"]["url"], primary_url.as_str());
+            assert_eq!(agent["mcp_settings"]["auth"], "forwarded");
+        })
+        .await;
+    }
+
+    /// Saving an optional server that never answers returns at once: its
+    /// static config is checked, its discovery is left to the background, and
+    /// the response claims nothing about its tools.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saving_a_blackholed_optional_server_does_not_wait_on_its_discovery() {
+        use workforce_common::session_postgres::PostgresSessionStore;
+        use workforce_postgres::test_support::with_test_pool;
+
+        with_test_pool(PostgresSessionStore::build_pool, |pool| async move {
+            let (state, _runtime, cookie) = agent_fixture(pool, None).await;
+            let primary = crate::mcp::tests::mock_mcp(&["acme.list_orders"]).await;
+            let blackhole = crate::mcp::tests::slow_mcp(std::time::Duration::from_secs(600)).await;
+            let save = |docs_url: String| {
+                let body = serde_json::json!({
+                    "mcp": {"url": format!("{}/mcp", primary.uri())},
+                    "mcp_servers": [{"id": "docs", "url": docs_url, "tool_prefix": "docs",
+                        "allowed_tools": ["docs.*"], "discovery_credential": "docs-svc"}],
+                });
+                send(
+                    &state,
+                    request(
+                        Method::PUT,
+                        "/admin/api/agents/support",
+                        &cookie,
+                        Some(body),
+                    ),
+                )
+            };
+
+            let started = std::time::Instant::now();
+            let (status, body) = save(format!("{}/mcp", blackhole.uri())).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the save waited on discovery: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(json(&body), serde_json::json!({"ok": true}));
+
+            let (status, body) = save("ftp://docs.acme.test".into()).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert!(body.contains("mcp_servers[docs].url"), "{body}");
+        })
+        .await;
+    }
+
     /// A tenant with no database behind it, for the checks that answer
     /// before any store is touched.
     fn store_less_fixture(git_managed: bool) -> (Arc<EdgeState>, String) {
@@ -9158,6 +9772,38 @@ mod tenant_tests {
         refused(
             serde_json::json!({"mcp": {"url": "ftp://mcp.acme.test"}}),
             "mcp.url",
+        )
+        .await;
+        let orphan = serde_json::json!({"mcp_servers": [
+            {"id": "docs", "url": "https://docs.acme.test/mcp", "allowed_tools": ["docs.*"]}
+        ]});
+        refused(orphan, "need the primary server").await;
+        let overlapping = serde_json::json!({
+            "mcp": {"url": "https://mcp.acme.test/mcp"},
+            "mcp_servers": [{"id": "crm", "url": "https://crm.acme.test/mcp", "allowed_tools": ["acme_list_orders"]}],
+        });
+        refused(overlapping.clone(), "mcp_servers[crm]").await;
+        refused(overlapping, "on server default").await;
+        refused(
+            serde_json::json!({
+                "mcp": {"url": "https://mcp.acme.test/mcp"},
+                "mcp_servers": [{"id": "docs", "url": "ftp://docs.acme.test", "allowed_tools": ["docs.*"]}],
+            }),
+            "mcp_servers[docs].url",
+        )
+        .await;
+        refused(
+            serde_json::json!({
+                "mcp": {"url": "https://mcp.acme.test/mcp"},
+                "mcp_servers": [{"id": "docs", "url": "https://docs.acme.test/mcp", "allowed_tools": ["docs.*"],
+                    "tool_grants": [{"source": "keycloak_role", "requires": "", "tools": ["docs.edit"]}]}],
+            }),
+            "mcp_servers[docs].tool_grants[0]",
+        )
+        .await;
+        refused(
+            serde_json::json!({"mcp": {"url": "https://mcp.acme.test/mcp", "auth": "forwarded", "audience": "acme-mcp"}}),
+            "mcp.audience",
         )
         .await;
         // A grant unlocks tools the spill list may then name.
@@ -9376,6 +10022,98 @@ mod tenant_tests {
         ("agents/assist/training/shifts.md", "# Shifts\n\nShifts run 8 to 4."),
         ("README.md", "ignored"),
     ];
+
+    /// An agent whose additional server's URL and credential are bound to
+    /// placeholders, under an id no other fixture uses.
+    const IMPORT_REPO_WITH_SERVERS: &[(&str, &str)] = &[(
+        "agents/northwind-help/agent.toml",
+        "id = \"northwind-help\"\ndisplay_name = \"Help\"\nsystem_prompt = \"You help.\"\n\
+         [embed]\nkeycloak_issuer = \"https://kc.acme.test/realms/staff\"\n\
+         allowed_tools = [\"acme.*\"]\n[embed.mcp]\nurl = \"${EDGE_MCP_URL}\"\n\
+         [[embed.mcp_servers]]\nid = \"docs\"\nurl = \"${EDGE_DOCS_MCP_URL}\"\n\
+         discovery_credential = \"${EDGE_DOCS_MCP_CREDENTIAL}\"\ntool_prefix = \"docs\"\n\
+         allowed_tools = [\"docs.*\"]\n",
+    )];
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_git_import_reports_placeholders_inside_additional_servers() {
+        use workforce_common::session_postgres::PostgresSessionStore;
+        use workforce_postgres::test_support::with_test_pool;
+
+        const CREDENTIAL: &str = "docs-svc-5d2e";
+        with_test_pool(PostgresSessionStore::build_pool, |pool| async move {
+            let github = crate::git_config::tests::mock_github(
+                "acme/edge-config",
+                "main",
+                IMPORT_REPO_WITH_SERVERS,
+            )
+            .await;
+            let (state, _runtime, cookie) = agent_fixture(pool, Some(&github.uri())).await;
+            let import =
+                |body: Value| request(Method::POST, "/admin/api/import/git", &cookie, Some(body));
+            let (status, body) = send(
+                &state,
+                import(serde_json::json!({"repo": "acme/edge-config", "token": "ghp_x"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert_eq!(
+                json(&body)["unresolved"],
+                serde_json::json!([
+                    "EDGE_DOCS_MCP_CREDENTIAL",
+                    "EDGE_DOCS_MCP_URL",
+                    "EDGE_MCP_URL"
+                ])
+            );
+
+            let primary = crate::mcp::tests::mock_mcp(&["acme.list_orders"]).await;
+            let docs = crate::mcp::tests::mock_mcp(&["search"]).await;
+            let (status, body) = send(
+                &state,
+                import(serde_json::json!({
+                    "repo": "acme/edge-config",
+                    "token": "ghp_x",
+                    "env": {
+                        "EDGE_MCP_URL": format!("{}/mcp", primary.uri()),
+                        "EDGE_DOCS_MCP_URL": format!("{}/mcp", docs.uri()),
+                        "EDGE_DOCS_MCP_CREDENTIAL": CREDENTIAL,
+                    },
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let (agent, listing) = listed_agent(&state, &cookie, "northwind-help").await;
+            assert_eq!(agent["mcp_servers"][0]["has_discovery_credential"], true);
+            assert!(!listing.contains(CREDENTIAL), "{listing}");
+            let Resolved::Tenant(rebuilt) = state.resolve("any.host") else {
+                panic!("the tenant serves");
+            };
+            let stored = rebuilt.config_store.load_all().await.unwrap();
+            assert_eq!(
+                stored[0].embed.mcp_servers[0]
+                    .connection
+                    .discovery_credential
+                    .as_deref(),
+                Some(CREDENTIAL)
+            );
+            let revisions = rebuilt
+                .revisions
+                .list("agent", "northwind-help")
+                .await
+                .unwrap();
+            let content = rebuilt
+                .revisions
+                .get("agent", "northwind-help", revisions[0].revision)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                content.contains("mcp_servers") && !content.contains(CREDENTIAL),
+                "{content}"
+            );
+        })
+        .await;
+    }
 
     /// The one-shot import: placeholders bind from the request alone and an
     /// unbound one refuses the whole import with nothing written; bound, the
@@ -9975,6 +10713,7 @@ mod tenant_tests {
                     mcp: Some(crate::agent::McpSettings {
                         url: mcp_url.into(),
                         discovery_credential: None,
+                        ..Default::default()
                     }),
                     ..Default::default()
                 },

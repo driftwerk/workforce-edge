@@ -77,6 +77,11 @@ pub struct EdgeConfig {
     /// Meaningful with `server.multi_tenant`; allowed without it.
     #[serde(default)]
     pub platform: Option<crate::platform::PlatformConfig>,
+    /// The Prometheus `/metrics` endpoint. Absent or disabled ⇒ the route is
+    /// not mounted and no recorder is installed; enabled ⇒ served only to a
+    /// scraper presenting its bearer token.
+    #[serde(default)]
+    pub metrics: Option<crate::metrics::MetricsConfig>,
 }
 
 /// `[git_config]` — the GitHub repo that holds agent definitions, playbooks, and
@@ -136,7 +141,8 @@ pub struct TokenExchangeConfig {
     pub client_secret: String,
     /// The MCP server's Keycloak clientId; when set, the exchanged token is
     /// audience-scoped to it. Absent ⇒ the token still gains a fresh TTL, just
-    /// without the audience restriction.
+    /// without the audience restriction. A server naming its own `audience` is
+    /// exchanged for that one instead.
     #[serde(default)]
     pub audience: Option<String>,
     /// Space-separated scopes to request on the exchanged token. Keycloak

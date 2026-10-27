@@ -31,6 +31,7 @@ pub mod knowledge;
 pub mod lessons;
 pub mod mcp;
 pub mod memory;
+pub mod metrics;
 pub mod migrate;
 pub mod oidc;
 pub mod outbound;
