@@ -714,7 +714,9 @@ pub struct McpSettings {
     pub audience: Option<String>,
     /// Whether this server being unavailable fails startup and the turn
     /// (`true`), or only removes its tools for the turn (`false`). `None` ⇒
-    /// `true` for the primary server, `false` for an additional one.
+    /// `true` for the primary server, `false` for an additional one. A server
+    /// that is not required and whose url cannot be used is left out of the
+    /// agent rather than failing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
     /// How long a server that is not required is skipped after its startup
@@ -871,7 +873,7 @@ impl<'a> McpServerSpec<'a> {
     }
 
     /// The config path this server's fields live under, for error messages.
-    fn field(&self) -> String {
+    pub(crate) fn field(&self) -> String {
         if self.primary {
             "mcp".to_string()
         } else {

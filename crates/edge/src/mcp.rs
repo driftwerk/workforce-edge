@@ -6,8 +6,9 @@
 //! merges them into one registry per turn, reaching every server concurrently
 //! so one slow or down server costs only its own tools — unless it is
 //! `required`, in which case the turn fails as a single-server agent's always
-//! has. The customer's token is carried by the
-//! per-turn client's [`AuthProvider`], which rides the `Arc` graph
+//! has. A server that is not required and whose URL cannot be used is left
+//! out of the agent rather than failing it. The customer's token is carried
+//! by the per-turn client's [`AuthProvider`], which rides the `Arc` graph
 //! (`EdgeMcpTool` → `McpClient` → transport) into the runner's spawned tool
 //! task — so the token reaches `tools/call` without any task-local or shared
 //! `SessionContext` change. Tool schemas are discovered once and cached: at
@@ -156,6 +157,64 @@ fn outcome_of(error: &eyre::Report) -> &'static str {
     }
 }
 
+/// Why a server's URL cannot be used. Never carries the URL, which may hold a
+/// secret; reads after the field it names (`mcp_servers[docs].url is required`).
+#[derive(Debug)]
+pub(crate) enum McpUrlError {
+    Missing,
+    Invalid(url::ParseError),
+    NotHttp,
+    Refused(OutboundError),
+}
+
+impl McpUrlError {
+    /// The `reason` an excluded server is counted under.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Missing => "missing_url",
+            Self::Invalid(_) | Self::NotHttp => "invalid_url",
+            Self::Refused(_) => "refused_url",
+        }
+    }
+}
+
+impl std::fmt::Display for McpUrlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => f.write_str("is required"),
+            Self::Invalid(e) => write!(f, "is not a URL: {e}"),
+            Self::NotHttp => f.write_str("must be an http(s) URL"),
+            Self::Refused(e) => write!(f, "is refused by the outbound policy: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for McpUrlError {}
+
+/// The endpoint `url` names, as far as `policy` can judge it without resolving it.
+pub(crate) fn endpoint(url: &str, policy: OutboundPolicy) -> Result<Url, McpUrlError> {
+    Some(url.trim())
+        .filter(|u| !u.is_empty())
+        .ok_or(McpUrlError::Missing)
+        .and_then(|u| Url::parse(u).map_err(McpUrlError::Invalid))
+        .and_then(|e| {
+            outbound::check_url_as_written(policy, &e)
+                .map(|()| e)
+                .map_err(McpUrlError::Refused)
+        })
+}
+
+/// [`endpoint`], and one the MCP client can speak to: http(s).
+pub(crate) fn http_endpoint(url: &str, policy: OutboundPolicy) -> Result<Url, McpUrlError> {
+    endpoint(url, policy).and_then(|e| {
+        if matches!(e.scheme(), "http" | "https") {
+            Ok(e)
+        } else {
+            Err(McpUrlError::NotHttp)
+        }
+    })
+}
+
 /// Whether `tool` reaches the model under a built-in's name. Compared in LLM-name
 /// space, where `data_query` and `data.query` are the same name: the runner
 /// resolves a direct match first, so an MCP twin would take the built-in's
@@ -295,20 +354,21 @@ impl std::fmt::Debug for McpToolset {
 }
 
 impl McpToolset {
-    /// Prepare one server for an agent: the URL is parsed and checked against
-    /// `policy` here, so a disallowed server fails the agent at build rather
-    /// than on a customer's first turn. Nothing is dialled.
+    /// Prepare one server for an agent; nothing is dialled. Every server's URL
+    /// is judged under `policy` as written. A required server's host is also
+    /// resolved and checked now, so a disallowed one fails the agent at build;
+    /// any other server's host is checked whenever it is reached, as every
+    /// server's is.
     fn prepare(
         scope: &AgentScope,
         spec: &McpServerSpec<'_>,
         policy: OutboundPolicy,
         install_audience: Option<&str>,
-    ) -> Result<Self> {
-        let url = &spec.connection.url;
-        let endpoint = Url::parse(url)
-            .wrap_err_with(|| format!("invalid MCP url {url:?} for server {}", spec.id))?;
-        outbound::check_url(policy, &endpoint)
-            .wrap_err_with(|| format!("refusing MCP url {url:?} for server {}", spec.id))?;
+    ) -> Result<Self, McpUrlError> {
+        let endpoint = endpoint(&spec.connection.url, policy)?;
+        if spec.required {
+            outbound::check_url(policy, &endpoint).map_err(McpUrlError::Refused)?;
+        }
         Ok(Self {
             scope: scope.clone(),
             id: spec.id.into(),
@@ -342,9 +402,11 @@ impl McpToolset {
         let Some(credential) = self.discovery_credential.clone() else {
             return Ok(());
         };
-        let client = self.client_for(Arc::new(StaticBearer::new(credential)))?;
         let tools = self
-            .timed_discovery(DiscoveryPhase::Startup, self.discover_on(&client))
+            .timed_discovery(DiscoveryPhase::Startup, async {
+                let client = self.client_for(Arc::new(StaticBearer::new(credential)))?;
+                self.discover_on(&client).await
+            })
             .await
             .wrap_err_with(|| format!("MCP tool discovery at startup (server {})", self.id))?;
         *self.defs.write().await = Some(CachedDefs::now(Arc::new(tools)));
@@ -364,7 +426,7 @@ impl McpToolset {
                     Duration::from_secs(MCP_REQUEST_TIMEOUT_SECS),
                     &self.endpoint,
                 )
-                .wrap_err_with(|| format!("refusing MCP url {}", self.endpoint))?,
+                .wrap_err_with(|| format!("refusing MCP url for server {}", self.id))?,
             ),
         };
         Ok(Arc::new(McpClient::new(
@@ -768,6 +830,8 @@ impl Drop for BackgroundDiscovery {
 pub struct McpCatalogue {
     scope: AgentScope,
     servers: Vec<McpToolset>,
+    /// Configured servers whose URL could not be used, left out of this build.
+    excluded: Vec<Arc<str>>,
     /// RFC 8693 exchanger (install-level, opt-in): mints a fresh, optionally
     /// audience-scoped downstream token per turn instead of forwarding the
     /// customer's raw token.
@@ -784,17 +848,19 @@ impl McpCatalogue {
         policy: OutboundPolicy,
         exchanger: Option<Arc<TokenExchanger>>,
     ) -> Result<Self> {
-        let servers = Self::prepare(&scope, embed, policy, exchanger.as_deref())?;
-        Self::start(scope, servers, exchanger).await
+        let (servers, unusable) = Self::prepare(&scope, embed, policy, exchanger.as_deref())?;
+        Self::start(scope, servers, unusable, exchanger).await
     }
 
-    /// Check the agent's servers and prepare each one; nothing is dialled.
-    fn prepare(
+    /// Check the agent's servers and prepare each one; nothing is dialled. A
+    /// required server whose URL cannot be used fails the build; any other is
+    /// returned with why, for [`Self::start`] to exclude.
+    fn prepare<'a>(
         scope: &AgentScope,
-        embed: &EmbedSettings,
+        embed: &'a EmbedSettings,
         policy: OutboundPolicy,
         exchanger: Option<&TokenExchanger>,
-    ) -> Result<Vec<McpToolset>> {
+    ) -> Result<(Vec<McpToolset>, Vec<Unusable<'a>>)> {
         embed.check_mcp_servers().map_err(|e| {
             metrics::config_refused(e.reason);
             eyre::Report::new(e)
@@ -813,19 +879,29 @@ impl McpCatalogue {
                 });
         }
         let install_audience = exchanger.and_then(TokenExchanger::audience);
-        specs
-            .iter()
-            .map(|spec| McpToolset::prepare(scope, spec, policy, install_audience))
-            .collect()
+        specs.into_iter().try_fold(
+            (Vec::new(), Vec::new()),
+            |(mut servers, mut unusable), spec| {
+                match McpToolset::prepare(scope, &spec, policy, install_audience) {
+                    Ok(server) => servers.push(server),
+                    Err(e) if spec.required => return Err(eyre!("{}.url {e}", spec.field())),
+                    Err(e) => unusable.push((spec, e)),
+                }
+                Ok((servers, unusable))
+            },
+        )
     }
 
     /// Discover at startup. A required server's discovery is awaited and its
     /// failure fails the build (fail-closed). Every other server with a
     /// discovery credential is discovered in the background: its tools appear
-    /// once found, and a turn before then discovers it lazily.
+    /// once found, and a turn before then discovers it lazily. Each `unusable`
+    /// server is excluded once the build is known to go on, so a build that
+    /// fails, and is retried, names and counts none of them.
     async fn start(
         scope: AgentScope,
         servers: Vec<McpToolset>,
+        unusable: Vec<Unusable<'_>>,
         exchanger: Option<Arc<TokenExchanger>>,
     ) -> Result<Self> {
         let background = Arc::new(BackgroundDiscovery::default());
@@ -841,9 +917,14 @@ impl McpCatalogue {
                 .map(McpToolset::discover_at_startup),
         )
         .await?;
+        let excluded = unusable
+            .iter()
+            .map(|(spec, e)| exclude(&scope, spec, e))
+            .collect();
         Ok(Self {
             scope,
             servers,
+            excluded,
             exchanger,
             background,
         })
@@ -855,8 +936,16 @@ impl McpCatalogue {
         self.background.cancel.cancel();
     }
 
+    /// Whether no server is configured, so the agent is a tool-less chat
+    /// agent. A catalogue whose every server was excluded is not empty.
     pub fn is_empty(&self) -> bool {
-        self.servers.is_empty()
+        self.servers.is_empty() && self.excluded.is_empty()
+    }
+
+    /// The configured servers this build left out because their URL could
+    /// not be used.
+    pub fn excluded(&self) -> &[Arc<str>] {
+        &self.excluded
     }
 
     /// The served tools per server — best-effort snapshot for logging.
@@ -974,6 +1063,22 @@ impl McpCatalogue {
     }
 }
 
+/// A server that is not required, with why its URL cannot be used.
+type Unusable<'a> = (McpServerSpec<'a>, McpUrlError);
+
+/// Leave `spec` out of the build: log it once, count it, and name it.
+fn exclude(scope: &AgentScope, spec: &McpServerSpec<'_>, e: &McpUrlError) -> Arc<str> {
+    tracing::warn!(
+        agent = scope.agent(),
+        server = %spec.id,
+        reason = e.reason(),
+        error = %format!("{}.url {e}", spec.field()),
+        "MCP server excluded: its url cannot be used, so the agent serves without its tools"
+    );
+    metrics::server_excluded(scope, spec.id, e.reason());
+    Arc::from(spec.id)
+}
+
 /// What a server said about itself when an operator surveyed it, and every
 /// tool it advertises — the catalogue the admin picks an allowlist from.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1023,16 +1128,13 @@ pub async fn survey(
     policy: OutboundPolicy,
 ) -> std::result::Result<McpSurvey, SurveyError> {
     let endpoint =
-        Url::parse(url.trim()).map_err(|e| SurveyError::Url(format!("not a URL: {e}")))?;
-    if !matches!(endpoint.scheme(), "http" | "https") {
-        return Err(SurveyError::Url("the MCP URL must be http(s)".into()));
-    }
+        http_endpoint(url, policy).map_err(|e| SurveyError::Url(format!("the MCP URL {e}")))?;
     let http = outbound::client_for(
         policy,
         Duration::from_secs(MCP_REQUEST_TIMEOUT_SECS),
         &endpoint,
     )
-    .map_err(|e| SurveyError::Url(format!("refusing the MCP URL: {e}")))?;
+    .map_err(|e| SurveyError::Url(format!("the MCP URL {}", McpUrlError::Refused(e))))?;
     let auth: Arc<dyn AuthProvider> = match credential.map(str::trim).filter(|c| !c.is_empty()) {
         Some(credential) => Arc::new(StaticBearer::new(credential)),
         None => Arc::new(NoAuth),
@@ -1238,11 +1340,13 @@ pub(crate) mod tests {
 
     /// [`build`] with every server's turn-start operations bounded by `limit`.
     async fn build_with_timeout(embed: &EmbedSettings, limit: Duration) -> Result<McpCatalogue> {
-        let servers = McpCatalogue::prepare(&scope(), embed, OutboundPolicy::Private, None)?
+        let (servers, unusable) =
+            McpCatalogue::prepare(&scope(), embed, OutboundPolicy::Private, None)?;
+        let servers = servers
             .into_iter()
             .map(|s| s.with_handshake_timeout(limit))
             .collect();
-        McpCatalogue::start(scope(), servers, None).await
+        McpCatalogue::start(scope(), servers, unusable, None).await
     }
 
     /// A primary with `harbor.*` and a startup credential, plus `docs`: an
@@ -1329,11 +1433,11 @@ pub(crate) mod tests {
     }
 
     /// A tenant's MCP url at a private or plain-http address is refused at
-    /// build under `Public` — for the primary and for an additional server
-    /// alike; the same url is accepted under `Private` (the self-hosted,
-    /// in-cluster case) exactly as before.
+    /// build under `Public`: a required server fails the build, an optional
+    /// one is left out of it. The same url is accepted under `Private` (the
+    /// self-hosted, in-cluster case) exactly as before.
     #[tokio::test]
-    async fn public_refuses_a_private_or_http_mcp_url_at_build() {
+    async fn public_refuses_a_required_server_and_excludes_an_optional_one_at_build() {
         for raw in [
             "http://mcp.example.com/mcp",
             "https://10.0.0.1/mcp",
@@ -1344,14 +1448,25 @@ pub(crate) mod tests {
             let primary = embed(raw, None);
             let mut additional = embed("https://93.184.216.34/mcp", None);
             additional.mcp_servers = vec![extra("docs", raw, Some("docs"), &["docs.*"])];
-            for (settings, server) in [(&primary, PRIMARY_MCP_ID), (&additional, "docs")] {
+            let mut required = additional.clone();
+            required.mcp_servers[0].connection.required = Some(true);
+            for (settings, field) in [(&primary, "mcp.url"), (&required, "mcp_servers[docs].url")] {
                 let err = McpCatalogue::build(scope(), settings, OutboundPolicy::Public, None)
                     .await
                     .err()
                     .expect("refused under Public")
                     .to_string();
-                assert!(err.contains("refusing MCP url"), "{raw}: {err}");
-                assert!(err.contains(&format!("server {server}")), "{raw}: {err}");
+                assert!(
+                    err.contains(&format!("{field} is refused by the outbound policy")),
+                    "{raw}: {err}"
+                );
+            }
+            let catalogue = McpCatalogue::build(scope(), &additional, OutboundPolicy::Public, None)
+                .await
+                .unwrap();
+            assert_eq!(server_ids(&catalogue), [PRIMARY_MCP_ID]);
+            assert_eq!(excluded_ids(&catalogue), ["docs"]);
+            for settings in [&primary, &additional, &required] {
                 let catalogue = build(settings).await.unwrap();
                 assert!(catalogue
                     .servers()
@@ -1378,16 +1493,275 @@ pub(crate) mod tests {
             .err()
             .expect("refused")
             .to_string();
-        assert!(err.contains("invalid MCP url"), "got: {err}");
+        assert!(err.contains("mcp.url is not a URL"), "got: {err}");
     }
 
+    /// A structural fault refuses the build even when the offending server's
+    /// URL also cannot be used: the check runs first, so nothing is prepared
+    /// and nothing is excluded.
+    #[test]
+    fn the_build_refuses_a_misconfigured_server() {
+        let (_, recorded) = recording(|| async {
+            let mut settings = embed("http://mcp.local", None);
+            settings.allowed_tools = vec!["harbor.*".into()];
+            settings.mcp_servers = vec![extra("crm", "", None, &["harbor_x"])];
+            let err = build(&settings).await.err().expect("overlap refused");
+            assert!(err.to_string().contains("overlaps"), "{err}");
+        });
+        assert_eq!(excluded_counts(&recorded), 0, "{recorded:?}");
+    }
+
+    /// Run `test` on a current-thread runtime under a local metrics recorder,
+    /// returning its value and every metric it recorded.
+    fn recording<T, F: Future<Output = T>>(
+        test: impl FnOnce() -> F,
+    ) -> (T, std::collections::BTreeMap<String, u64>) {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let value = ::metrics::with_local_recorder(&recorder, || runtime.block_on(test()));
+        (value, crate::metrics::tests::recorded(&snapshotter))
+    }
+
+    /// How many `edge_mcp_server_excluded_total` increments `recorded` holds.
+    fn excluded_counts(recorded: &std::collections::BTreeMap<String, u64>) -> u64 {
+        recorded
+            .iter()
+            .filter(|(key, _)| key.starts_with("edge_mcp_server_excluded_total"))
+            .map(|(_, count)| count)
+            .sum()
+    }
+
+    fn server_ids(catalogue: &McpCatalogue) -> Vec<&str> {
+        catalogue.servers().iter().map(|s| &*s.id).collect()
+    }
+
+    pub(crate) fn excluded_ids(catalogue: &McpCatalogue) -> Vec<&str> {
+        catalogue.excluded().iter().map(|id| &**id).collect()
+    }
+
+    #[test]
+    fn an_endpoint_names_what_is_wrong_and_never_the_url() {
+        for blank in ["", "  "] {
+            let e = endpoint(blank, OutboundPolicy::Private).unwrap_err();
+            assert!(matches!(e, McpUrlError::Missing), "{e:?}");
+            assert_eq!(
+                (e.reason(), e.to_string().as_str()),
+                ("missing_url", "is required")
+            );
+        }
+        let e = endpoint("docs.example.com/mcp?key=s3cret", OutboundPolicy::Private).unwrap_err();
+        assert!(matches!(e, McpUrlError::Invalid(_)), "{e:?}");
+        assert_eq!(e.reason(), "invalid_url");
+        assert!(e.to_string().starts_with("is not a URL:"), "{e}");
+        assert!(!e.to_string().contains("s3cret"), "{e}");
+
+        let ftp = "ftp://kb.example.com/mcp";
+        assert!(endpoint(ftp, OutboundPolicy::Private).is_ok());
+        let e = http_endpoint(ftp, OutboundPolicy::Private).unwrap_err();
+        assert!(matches!(e, McpUrlError::NotHttp), "{e:?}");
+        assert_eq!(
+            (e.reason(), e.to_string().as_str()),
+            ("invalid_url", "must be an http(s) URL")
+        );
+
+        for check in [endpoint, http_endpoint] {
+            let e = check("http://docs.example.com/mcp", OutboundPolicy::Public).unwrap_err();
+            assert!(
+                matches!(e, McpUrlError::Refused(OutboundError::NotHttps)),
+                "{e:?}"
+            );
+            assert_eq!(e.reason(), "refused_url");
+            assert_eq!(
+                e.to_string(),
+                "is refused by the outbound policy: only https URLs may be called"
+            );
+            assert_eq!(
+                check("HTTPS://Docs.Example.com/mcp", OutboundPolicy::Public)
+                    .unwrap()
+                    .as_str(),
+                "https://docs.example.com/mcp"
+            );
+        }
+    }
+
+    /// An optional server whose URL cannot be used is left out of the build,
+    /// named once and counted, and never reached, even with a startup
+    /// credential; the agent serves the rest.
+    #[test]
+    fn an_optional_server_whose_url_cannot_be_used_is_excluded() {
+        let (_, recorded) = recording(|| async {
+            let primary = mock_mcp(&["harbor.list_orders"]).await;
+            let mut settings = embed(&primary.uri(), None);
+            settings.allowed_tools = vec!["harbor.*".into()];
+            let mut kb = extra("kb", "kb.example.com/mcp", Some("kb"), &["kb.*"]);
+            kb.connection.discovery_credential = Some("kb-cred".into());
+            settings.mcp_servers = vec![
+                extra("docs", "", Some("docs"), &["docs.*"]),
+                extra("wiki", "not a url", Some("wiki"), &["wiki.*"]),
+                kb,
+            ];
+            let catalogue = build(&settings).await.unwrap();
+            assert_eq!(server_ids(&catalogue), [PRIMARY_MCP_ID]);
+            assert_eq!(excluded_ids(&catalogue), ["docs", "wiki", "kb"]);
+            assert!(!catalogue.is_empty());
+            catalogue.settled().await;
+            let registry = catalogue.registry_for(&customer()).await.unwrap();
+            assert!(registry.has("harbor.list_orders") && registry.len() == 1);
+        });
+        crate::metrics::tests::assert_bounded(&recorded);
+        for (server, reason) in [
+            ("docs", "missing_url"),
+            ("wiki", "invalid_url"),
+            ("kb", "invalid_url"),
+        ] {
+            let key = format!(
+                "edge_mcp_server_excluded_total{{agent=acme-help,reason={reason},server={server},tenant=acme}}"
+            );
+            assert_eq!(recorded.get(&key), Some(&1), "{key} in {recorded:?}");
+            assert!(
+                recorded
+                    .keys()
+                    .all(|key| !key.contains(&format!("server={server},"))
+                        || key.starts_with("edge_mcp_server_excluded_total")),
+                "{server} was reached: {recorded:?}"
+            );
+        }
+    }
+
+    /// A required server whose URL cannot be used fails the build by field,
+    /// without the URL, and excludes nothing: not even an optional server
+    /// prepared before it, nor one beside a required server down at startup,
+    /// whose build never served.
+    #[test]
+    fn a_required_server_whose_url_cannot_be_used_fails_the_build() {
+        let (_, recorded) = recording(|| async {
+            let healthy = mock_mcp(&["harbor.list_orders"]).await;
+            for raw in ["", "not a url", "docs.example.com/mcp?key=s3cret"] {
+                let err = build(&embed(raw, None)).await.err().expect("refused");
+                let err = format!("{err:#}");
+                assert!(err.contains("mcp.url is"), "{raw}: {err}");
+                assert!(!err.contains("s3cret"), "{raw}: {err}");
+
+                let mut settings = embed(&healthy.uri(), None);
+                settings.allowed_tools = vec!["harbor.*".into()];
+                let mut docs = extra("docs", raw, Some("docs"), &["docs.*"]);
+                docs.connection.required = Some(true);
+                settings.mcp_servers = vec![docs];
+                let err = build(&settings).await.err().expect("refused");
+                let err = format!("{err:#}");
+                assert!(err.contains("mcp_servers[docs].url is"), "{raw}: {err}");
+                assert!(!err.contains("s3cret"), "{raw}: {err}");
+            }
+
+            let mut settings = embed(&healthy.uri(), None);
+            settings.allowed_tools = vec!["harbor.*".into()];
+            let mut wiki = extra("wiki", "not a url", Some("wiki"), &["wiki.*"]);
+            wiki.connection.required = Some(true);
+            settings.mcp_servers = vec![extra("docs", "", Some("docs"), &["docs.*"]), wiki];
+            let err = build(&settings).await.err().expect("refused");
+            assert!(
+                err.to_string()
+                    .contains("mcp_servers[wiki].url is not a URL"),
+                "{err}"
+            );
+
+            let mut settings = embed(&closed_port_url(), Some("svc-cred"));
+            settings.allowed_tools = vec!["harbor.*".into()];
+            settings.mcp_servers = vec![extra("docs", "", Some("docs"), &["docs.*"])];
+            let err = build(&settings).await.err().expect("the primary is down");
+            assert!(
+                format!("{err:#}").contains("MCP tool discovery at startup"),
+                "{err:#}"
+            );
+        });
+        assert_eq!(excluded_counts(&recorded), 0, "{recorded:?}");
+    }
+
+    /// An agent whose only server was excluded is not a tool-less chat agent:
+    /// its turns find no server available, as when every server is down.
     #[tokio::test]
-    async fn the_build_refuses_a_misconfigured_server() {
-        let mut settings = embed("http://mcp.local", None);
-        settings.allowed_tools = vec!["harbor.*".into()];
-        settings.mcp_servers = vec![extra("crm", "http://crm.local", None, &["harbor_x"])];
-        let err = build(&settings).await.err().expect("overlap refused");
-        assert!(err.to_string().contains("overlaps"), "{err}");
+    async fn an_agent_whose_every_server_was_excluded_is_not_tool_less() {
+        let mut settings = embed("", None);
+        if let Some(mcp) = settings.mcp.as_mut() {
+            mcp.required = Some(false);
+        }
+        let catalogue = build(&settings).await.unwrap();
+        assert!(!catalogue.is_empty());
+        let err = catalogue
+            .registry_for(&customer())
+            .await
+            .err()
+            .expect("no server to answer");
+        assert!(
+            err.to_string().contains("no MCP server is available"),
+            "{err}"
+        );
+    }
+
+    /// Under `Public` an optional server is judged at build from its URL as
+    /// written: a plain-http or private-literal one is excluded, while one
+    /// whose host does not resolve is kept and found unreachable when it is
+    /// reached. A required server's host is resolved at build. Relies on
+    /// `.invalid` resolving to nothing (RFC 6761).
+    #[test]
+    fn under_public_an_optional_server_is_judged_as_written_and_resolved_when_reached() {
+        let with_kb = |required: Option<bool>| {
+            let mut settings = embed("https://93.184.216.34/mcp", None);
+            settings.allowed_tools = vec!["harbor.*".into()];
+            let mut kb = extra(
+                "kb",
+                "https://kb.unresolvable.invalid/mcp",
+                Some("kb"),
+                &["kb.*"],
+            );
+            kb.connection.discovery_credential = Some("kb-cred".into());
+            kb.connection.required = required;
+            settings.mcp_servers = vec![
+                extra(
+                    "docs",
+                    "http://docs.example.com/mcp",
+                    Some("docs"),
+                    &["docs.*"],
+                ),
+                extra("wiki", "https://10.0.0.7/mcp", Some("wiki"), &["wiki.*"]),
+                kb,
+            ];
+            settings
+        };
+        let (_, recorded) = recording(|| async {
+            let catalogue =
+                McpCatalogue::build(scope(), &with_kb(None), OutboundPolicy::Public, None)
+                    .await
+                    .unwrap();
+            assert_eq!(server_ids(&catalogue), [PRIMARY_MCP_ID, "kb"]);
+            assert_eq!(excluded_ids(&catalogue), ["docs", "wiki"]);
+            catalogue.settled().await;
+            assert!(catalogue.servers()[1].in_skip_window());
+
+            let err =
+                McpCatalogue::build(scope(), &with_kb(Some(true)), OutboundPolicy::Public, None)
+                    .await
+                    .err()
+                    .expect("a required server's host is resolved at build");
+            assert!(
+                err.to_string().contains(
+                    "mcp_servers[kb].url is refused by the outbound policy: kb.unresolvable.invalid could not be resolved"
+                ),
+                "{err}"
+            );
+        });
+        for (key, expected) in [
+            ("edge_mcp_server_excluded_total{agent=acme-help,reason=refused_url,server=docs,tenant=acme}", 1),
+            ("edge_mcp_server_excluded_total{agent=acme-help,reason=refused_url,server=wiki,tenant=acme}", 1),
+            ("edge_mcp_discovery_total{agent=acme-help,outcome=unreachable,phase=startup,server=kb,tenant=acme}", 1),
+            ("edge_mcp_skip_window_entered_total{agent=acme-help,server=kb,tenant=acme}", 1),
+        ] {
+            assert_eq!(recorded.get(key).copied().unwrap_or(0), expected, "{key} in {recorded:?}");
+        }
     }
 
     #[tokio::test]
@@ -1487,8 +1861,7 @@ pub(crate) mod tests {
         where
             E: std::error::Error + Send + Sync + 'static,
         {
-            let refused =
-                || Err::<(), _>(error()).wrap_err("refusing MCP url https://docs.example.com/mcp");
+            let refused = || Err::<(), _>(error()).wrap_err("refusing MCP url for server docs");
             [
                 refused().unwrap_err(),
                 refused()
@@ -2854,7 +3227,10 @@ pub(crate) mod tests {
         let url = format!("{}/mcp", server.uri());
         match survey(&url, None, OutboundPolicy::Public).await {
             Err(SurveyError::Url(reason)) => {
-                assert!(reason.contains("refusing the MCP URL"), "{reason}")
+                assert!(
+                    reason.contains("refused by the outbound policy"),
+                    "{reason}"
+                )
             }
             other => panic!("a loopback http URL must be refused under Public: {other:?}"),
         }

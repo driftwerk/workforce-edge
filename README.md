@@ -42,11 +42,21 @@ write tiers. A server that is not `required` being down only removes its tools
 for that turn. One that times out or cannot be reached (connection refused,
 DNS, TLS, connect timeout) also sits out the next `unavailable_skip_secs`
 seconds (default 60, 0 never skips). One that answers with an error, or whose
-address the outbound policy refuses, is retried on the next turn. The startup
-discovery of a server that is not `required` runs in the background, so it never
-holds boot or an admin save. Give each server its own token-exchange `audience`, so a token
-minted for one server is not accepted by another. `config/edge.example.toml`
-describes every key. `edge.toml` seeds agents on first boot only, so an
+host resolves to an address the outbound policy refuses, is retried on the
+next turn. A server whose URL cannot be used (missing, for example an unset
+`${VAR}`, which expands to an empty string; not a URL; or refused by the
+outbound policy as written) fails startup, a git sync or an admin save when it
+is `required`. Otherwise the agent is built without it, and the edge logs it
+once by server id and counts `edge_mcp_server_excluded_total`. It returns with
+the next rebuild that carries a usable URL: a repo change, an admin save, or a
+restart (an environment variable is read only at start). Under `public`, an
+admin save refuses such a URL with a 422 naming the field. Under `public`,
+only a required server's host is resolved at build; any other server's host is
+resolved when it is reached, so a DNS failure is an outage, not a config
+fault. The startup discovery of a server that is not `required` runs in the
+background, so it never holds boot or an admin save. Give each server its own
+token-exchange `audience`, so a token minted for one server is not accepted by
+another. `config/edge.example.toml` describes every key. `edge.toml` seeds agents on first boot only, so an
 existing install adds servers through the admin UI, the admin API or its git
 config.
 
@@ -82,6 +92,7 @@ tool's arguments or a URL.
 | `edge_mcp_tool_call_duration_seconds` | histogram | `tenant`, `agent`, `server`, `tool` |
 | `edge_mcp_server_skipped_total` | counter | `tenant`, `agent`, `server`. A turn skipped a server inside its skip window. |
 | `edge_mcp_skip_window_entered_total` | counter | `tenant`, `agent`, `server`. A startup discovery or turn start that timed out or could not reach the server opened its skip window. |
+| `edge_mcp_server_excluded_total` | counter | `tenant`, `agent`, `server`, `reason` (`missing_url`, `invalid_url`, `refused_url`). A build left out a server that is not required because its URL cannot be used. |
 | `edge_mcp_token_exchanges_total` | counter | `tenant`, `agent`, `audience`, `outcome` (`ok`, `failed`) |
 | `edge_mcp_token_exchange_duration_seconds` | histogram | `tenant`, `agent`, `audience` |
 | `edge_mcp_config_refusals_total` | counter | `reason`, one of `missing_primary`, `invalid_id`, `reserved_id`, `duplicate_id`, `invalid_prefix`, `empty_allowlist`, `invalid_grant`, `outside_prefix`, `invalid_audience`, `skip_on_required`, `name_collision` |

@@ -360,7 +360,7 @@ describe("setup api", () => {
   it("rejects discovery with the server's reason", async () => {
     fetchAnswering(502, { error: "MCP initialize failed: transport error" });
     await expect(discoverMcp({ url: "https://mcp.acme.test/mcp" })).rejects.toThrow("MCP initialize failed");
-    fetchAnswering(422, { error: "refusing the MCP URL: only https URLs may be called" });
+    fetchAnswering(422, { error: "the MCP URL is refused by the outbound policy: only https URLs may be called" });
     await expect(discoverMcp({ url: "http://mcp.acme.test/mcp" })).rejects.toThrow("only https");
   });
 
