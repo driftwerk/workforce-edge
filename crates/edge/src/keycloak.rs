@@ -883,8 +883,7 @@ BN8Z7ilJ9x6e7aTOtFWGhRXtuJDhfroLRx0kpEq4WIS/EATF0/8AYlxsNkrcGSBG
         let err = validator
             .fetch_keys()
             .await
-            .err()
-            .expect("a loopback http idp is refused")
+            .expect_err("a loopback http idp is refused")
             .to_string();
         assert!(err.contains("refusing to fetch"), "{err}");
         let err = discover_endpoints_with(&issuer, OutboundPolicy::Public)
