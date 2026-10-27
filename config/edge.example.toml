@@ -37,6 +37,15 @@ connect_budget_secs = 300
 url = "http://edge-weaviate.internal:8080"
 # Required: the edge's own class, never the hub's WorkforceMemory.
 collection = "EdgeMemory"
+# An edge that kept its memories in its Weaviate's WorkforceMemory class (the
+# old default) names it here, beside its own class: memories move into
+# `collection` while the edge serves, one replica copying at a time, and
+# forgetting and erasure reach both. Boot refuses a class that holds anything
+# but the edge's memories, or that does not exist. To give it up afterwards:
+# remove this line and deploy, then
+#   workforce-edge memory drop-previous --config edge.toml --collection WorkforceMemory [--apply]
+# `workforce-edge memory check-previous --config edge.toml` reports on it.
+# previous_collection = "WorkforceMemory"
 # api_key = "CHANGE_ME"   # when the instance is authenticated
 connect_budget_secs = 300
 
