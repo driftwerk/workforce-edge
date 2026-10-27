@@ -179,6 +179,18 @@ pub fn check_url(policy: OutboundPolicy, url: &Url) -> Result<(), OutboundError>
     }
 }
 
+/// [`check_url`] judged from the URL as written: a domain is not resolved, so
+/// only the scheme, a missing host or an address literal can be refused.
+pub fn check_url_as_written(policy: OutboundPolicy, url: &Url) -> Result<(), OutboundError> {
+    match policy {
+        OutboundPolicy::Private => Ok(()),
+        OutboundPolicy::Public => match approve(url, |_, _| Vec::new()) {
+            Err(OutboundError::Unresolvable(_)) => Ok(()),
+            result => result.map(drop),
+        },
+    }
+}
+
 /// What a `Public` client does with a redirect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Redirects {
@@ -498,6 +510,35 @@ mod tests {
         ]
         .iter()
         .for_each(|refusal| assert!(!refusal.is_unreachable(), "{refusal}"));
+    }
+
+    #[test]
+    fn a_url_as_written_is_judged_without_resolving_it() {
+        let cases = [
+            ("http://docs.example.com/mcp", Err(OutboundError::NotHttps)),
+            (
+                "https://10.0.0.7/mcp",
+                Err(OutboundError::PrivateAddress("10.0.0.7".parse().unwrap())),
+            ),
+            (
+                "https://[fd00::1]/mcp",
+                Err(OutboundError::PrivateAddress("fd00::1".parse().unwrap())),
+            ),
+            ("https://93.184.216.34/mcp", Ok(())),
+            ("https://docs.unresolvable.invalid/mcp", Ok(())),
+        ];
+        cases.into_iter().for_each(|(raw, expected)| {
+            assert_eq!(
+                check_url_as_written(OutboundPolicy::Public, &url(raw)),
+                expected,
+                "{raw}"
+            );
+            assert_eq!(
+                check_url_as_written(OutboundPolicy::Private, &url(raw)),
+                Ok(()),
+                "{raw}"
+            );
+        });
     }
 
     #[test]

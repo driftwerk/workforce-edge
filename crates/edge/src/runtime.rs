@@ -1026,7 +1026,10 @@ mod tests {
                 panic!("a public tenant must refuse a loopback http MCP server");
             };
             let message = format!("{err:#}");
-            assert!(message.contains("refusing MCP url"), "{message}");
+            assert!(
+                message.contains("mcp.url is refused by the outbound policy"),
+                "{message}"
+            );
             assert!(message.contains("building agent host support"), "{message}");
 
             let runtime = TenantRuntime::build(with_policy(OutboundPolicy::Private), &infra)
@@ -1038,58 +1041,71 @@ mod tests {
         .await;
     }
 
-    /// The same build-time refusal for an additional server: a `public`
-    /// tenant refuses a loopback `http` one even when the primary is a public
-    /// https address, and the error names the server.
+    /// An additional server a `public` tenant refuses as written, a loopback
+    /// `http` one beside a public https primary, is left out of the agent when
+    /// it is optional, and fails the build by field when it is required.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_public_tenant_refuses_a_private_additional_mcp_server_at_build() {
+    async fn a_public_tenant_excludes_an_optional_server_it_refuses_and_refuses_a_required_one() {
         use crate::agent::{EmbedSettings, McpServerSettings, McpSettings};
         use crate::analytics::run_edge_analytics_migrations;
         use crate::tenant::run_edge_migrations;
         use workforce_common::session_postgres::{run_session_migrations, PostgresSessionStore};
         use workforce_postgres::test_support::with_test_pool;
 
-        with_test_pool(PostgresSessionStore::build_pool, |pool| async move {
-            run_session_migrations(&pool).await.unwrap();
-            run_edge_analytics_migrations(&pool).await.unwrap();
-            run_edge_migrations(&pool).await.unwrap();
-            let infra = SharedInfra::for_tests_on(pool);
-            let agent = EdgeAgent {
-                id: "acme-help".into(),
-                embed: EmbedSettings {
-                    mcp: Some(McpSettings {
-                        url: "https://93.184.216.34/mcp".into(),
-                        ..Default::default()
-                    }),
-                    mcp_servers: vec![McpServerSettings {
-                        id: "docs".into(),
-                        connection: McpSettings {
-                            url: "http://127.0.0.1:2/mcp".into(),
+        for required in [None, Some(true)] {
+            with_test_pool(PostgresSessionStore::build_pool, |pool| async move {
+                run_session_migrations(&pool).await.unwrap();
+                run_edge_analytics_migrations(&pool).await.unwrap();
+                run_edge_migrations(&pool).await.unwrap();
+                let infra = SharedInfra::for_tests_on(pool);
+                let agent = EdgeAgent {
+                    id: "acme-help".into(),
+                    embed: EmbedSettings {
+                        mcp: Some(McpSettings {
+                            url: "https://93.184.216.34/mcp".into(),
                             ..Default::default()
-                        },
-                        tool_prefix: Some("docs".into()),
-                        allowed_tools: vec!["docs.*".into()],
-                        tool_grants: vec![],
-                    }],
+                        }),
+                        mcp_servers: vec![McpServerSettings {
+                            id: "docs".into(),
+                            connection: McpSettings {
+                                url: "http://127.0.0.1:2/mcp".into(),
+                                required,
+                                ..Default::default()
+                            },
+                            tool_prefix: Some("docs".into()),
+                            allowed_tools: vec!["docs.*".into()],
+                            tool_grants: vec![],
+                        }],
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            };
-            let settings = TenantSettings {
-                seed_agents: vec![agent],
-                outbound: OutboundPolicy::Public,
-                ..settings("default")
-            };
-            let Err(err) = TenantRuntime::build(settings, &infra).await else {
-                panic!("a public tenant must refuse a loopback http additional server");
-            };
-            let message = format!("{err:#}");
-            assert!(
-                message.contains("refusing MCP url") && message.contains("for server docs"),
-                "{message}"
-            );
-        })
-        .await;
+                };
+                let settings = TenantSettings {
+                    seed_agents: vec![agent],
+                    outbound: OutboundPolicy::Public,
+                    ..settings("default")
+                };
+                match (required, TenantRuntime::build(settings, &infra).await) {
+                    (None, Ok(runtime)) => {
+                        let host = runtime.host("acme-help").expect("the agent serves");
+                        assert_eq!(crate::mcp::tests::excluded_ids(host.mcp()), ["docs"]);
+                    }
+                    (Some(true), Err(err)) => {
+                        let message = format!("{err:#}");
+                        assert!(
+                            message.contains("building agent host acme-help")
+                                && message.contains(
+                                    "mcp_servers[docs].url is refused by the outbound policy"
+                                ),
+                            "{message}"
+                        );
+                    }
+                    (required, Ok(_)) => panic!("required = {required:?} must not build"),
+                    (required, Err(err)) => panic!("required = {required:?} must build: {err:#}"),
+                }
+            })
+            .await;
+        }
     }
 
     /// The install's provider allowlist is checked before anything is
