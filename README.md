@@ -42,19 +42,21 @@ write tiers. A server that is not `required` being down only removes its tools
 for that turn. One that times out or cannot be reached (connection refused,
 DNS, TLS, connect timeout) also sits out the next `unavailable_skip_secs`
 seconds (default 60, 0 never skips). One that answers with an error, or whose
-address the outbound policy refuses, is retried on the next turn. A server
-whose URL cannot be used (missing, as an unset `${VAR}` expands to an empty
-string; not a URL; or refused by the outbound policy as written) fails the
-build when it is `required`. Otherwise the agent is built without it, and the
-edge logs it once by server id and counts `edge_mcp_server_excluded_total`; it
-is back after the next rebuild that carries a usable URL: a repo change, an
-admin save, or a restart (an environment variable is read only at start).
-Under `public`, only a required server's host is resolved at build; any other
-server's host is resolved when it is reached, so a DNS failure is an outage,
-not a config fault. The startup discovery of a server that is not `required`
-runs in the background, so it never holds boot or an admin save. Give each server its own token-exchange `audience`, so a token
-minted for one server is not accepted by another. `config/edge.example.toml`
-describes every key. `edge.toml` seeds agents on first boot only, so an
+host resolves to an address the outbound policy refuses, is retried on the
+next turn. A server whose URL cannot be used (missing, for example an unset
+`${VAR}`, which expands to an empty string; not a URL; or refused by the
+outbound policy as written) fails startup, a git sync or an admin save when it
+is `required`. Otherwise the agent is built without it, and the edge logs it
+once by server id and counts `edge_mcp_server_excluded_total`. It returns with
+the next rebuild that carries a usable URL: a repo change, an admin save, or a
+restart (an environment variable is read only at start). Under `public`, an
+admin save refuses such a URL with a 422 naming the field. Under `public`,
+only a required server's host is resolved at build; any other server's host is
+resolved when it is reached, so a DNS failure is an outage, not a config
+fault. The startup discovery of a server that is not `required` runs in the
+background, so it never holds boot or an admin save. Give each server its own
+token-exchange `audience`, so a token minted for one server is not accepted by
+another. `config/edge.example.toml` describes every key. `edge.toml` seeds agents on first boot only, so an
 existing install adds servers through the admin UI, the admin API or its git
 config.
 
