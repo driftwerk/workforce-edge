@@ -405,7 +405,7 @@ function McpConnectionFields({
           value={value.unavailable_skip_secs}
           disabled={off || value.required}
           aria-label="Skip window in seconds"
-          title="seconds an unavailable server sits out; 0 never skips"
+          title="seconds a server that times out or cannot be reached sits out; 0 never skips"
           onChange={(e) => set("unavailable_skip_secs", e.target.value)}
         />
       </div>
