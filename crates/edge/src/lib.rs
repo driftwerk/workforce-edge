@@ -39,6 +39,7 @@ pub mod passive_memory;
 pub mod permissions;
 pub mod platform;
 pub mod playbook;
+pub mod previous;
 pub mod rich_output;
 pub mod runtime;
 pub mod server;

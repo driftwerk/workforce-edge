@@ -453,6 +453,12 @@ pub struct WeaviateConfig {
     /// stores, where the edge's erasure did not reach their copies.
     #[serde(default)]
     pub collection: Option<String>,
+    /// The class the edge kept its memories in before it named its own
+    /// (the edge's default, `WorkforceMemory`), held beside `collection`
+    /// until removed: memories are moved into `collection` while replicas
+    /// serve, and forgetting and erasure reach both.
+    #[serde(default)]
+    pub previous_collection: Option<String>,
     /// Seconds to keep retrying readiness before aborting boot.
     #[serde(default = "default_connect_budget_secs")]
     pub connect_budget_secs: u64,
@@ -499,6 +505,28 @@ impl WeaviateConfig {
             ));
         }
         Ok(name)
+    }
+
+    /// The class memories are moving from, when one is held beside the
+    /// edge's own: named, and not the edge's own. It may be the hub's name,
+    /// `WorkforceMemory`: the edge kept its memories in a class of that name
+    /// in a Weaviate of its own, and boot refuses one that holds anything
+    /// but the edge's memories.
+    pub fn previous_collection(&self) -> Result<Option<&str>> {
+        let Some(previous) = self.previous_collection.as_deref().map(str::trim) else {
+            return Ok(None);
+        };
+        if previous.is_empty() {
+            return Err(eyre::eyre!(
+                "[weaviate] previous_collection is empty: name the class memories are moving from, or leave it out"
+            ));
+        }
+        if previous.eq_ignore_ascii_case(self.own_collection()?) {
+            return Err(eyre::eyre!(
+                "[weaviate] previous_collection {previous:?} is collection itself; name the class memories are moving from"
+            ));
+        }
+        Ok(Some(previous))
     }
 }
 
@@ -627,6 +655,7 @@ impl EdgeConfig {
         match (&self.weaviate, &self.vellev) {
             (Some(weaviate), None) => {
                 weaviate.own_collection()?;
+                weaviate.previous_collection()?;
                 Ok(MemoryBackend::Weaviate(weaviate))
             }
             (None, Some(vellev)) => {
@@ -761,6 +790,40 @@ mod tests {
             panic!("a [weaviate] section names Weaviate");
         };
         assert_eq!(weaviate.collection.as_deref(), Some("EdgeMemory"));
+    }
+
+    /// A class memories move from may be the edge's old default, the hub's
+    /// name, but must be named and must not be the edge's own class.
+    #[test]
+    fn a_previous_collection_is_named_and_not_the_edges_own() {
+        let with = |previous: &str| {
+            config_from(&format!(
+                "{WITHOUT_VECTOR_STORE}\n[weaviate]\nurl = \"http://weaviate:8080\"\ncollection = \"EdgeMemory\"\nprevious_collection = {previous:?}"
+            ))
+        };
+        for refused in ["", "  ", "EdgeMemory", "edgeMemory"] {
+            let err = with(refused).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("[weaviate] previous_collection"),
+                "{refused:?} must be refused: {err:#}"
+            );
+        }
+        let moving = with("WorkforceMemory").unwrap();
+        let MemoryBackend::Weaviate(weaviate) = moving.memory_backend().unwrap() else {
+            panic!("a [weaviate] section names Weaviate");
+        };
+        assert_eq!(
+            weaviate.previous_collection().unwrap(),
+            Some("WorkforceMemory")
+        );
+        let settled = config_from(&format!(
+            "{WITHOUT_VECTOR_STORE}\n[weaviate]\nurl = \"http://weaviate:8080\"\ncollection = \"EdgeMemory\""
+        ))
+        .unwrap();
+        let MemoryBackend::Weaviate(weaviate) = settled.memory_backend().unwrap() else {
+            panic!("a [weaviate] section names Weaviate");
+        };
+        assert_eq!(weaviate.previous_collection().unwrap(), None);
     }
 
     /// Recall floors were tuned on MiniLM's certainty; a `score_map` puts

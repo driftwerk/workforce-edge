@@ -192,7 +192,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     let args = ImportArgs::from_args(args)?;
     let config = EdgeConfig::load(&args.config)
         .wrap_err_with(|| format!("loading edge config from {}", args.config.display()))?;
-    let pool = build_pool(&config.postgres)?;
+    let pool = build_pool(&config.postgres, "workforce-edge-import")?;
     pool.ping()
         .await
         .wrap_err("reaching the deployment's Postgres")?;
@@ -203,10 +203,13 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
 }
 
 /// The deployment's pool as boot builds it (`boot::postgres_config`), under
-/// its own application name. No migration runs here: the target is a
-/// deployment already serving its tenants, and [`import`] checks the shape
-/// it finds rather than changing it.
-fn build_pool(cfg: &crate::config::PostgresConfig) -> Result<PostgresPool> {
+/// `application_name`, for an operator command. No migration runs here: the
+/// target is a deployment already serving its tenants, and the command
+/// checks the shape it finds rather than changing it.
+pub(crate) fn build_pool(
+    cfg: &crate::config::PostgresConfig,
+    application_name: &str,
+) -> Result<PostgresPool> {
     let sslmode = match cfg.sslmode.to_ascii_lowercase().as_str() {
         "disable" => SslMode::Disable,
         _ => SslMode::Require,
@@ -216,10 +219,11 @@ fn build_pool(cfg: &crate::config::PostgresConfig) -> Result<PostgresPool> {
         url: Some(cfg.url.clone()),
         sslmode,
         connect_timeout_secs: cfg.connect_budget_secs,
-        application_name: Some("workforce-edge-import".to_string()),
+        application_name: Some(application_name.to_string()),
         ..PostgresConfig::default()
     };
-    PostgresSessionStore::build_pool(&pg).wrap_err("building the import's pool")
+    PostgresSessionStore::build_pool(&pg)
+        .wrap_err_with(|| format!("building the {application_name} pool"))
 }
 
 /// The dump as a seekable file: the import reads it twice. Stdin is spooled
