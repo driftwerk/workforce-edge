@@ -10310,11 +10310,7 @@ mod tenant_tests {
                     .as_deref(),
                 Some(CREDENTIAL)
             );
-            let revisions = rebuilt
-                .revisions
-                .list("agent", "acme-help")
-                .await
-                .unwrap();
+            let revisions = rebuilt.revisions.list("agent", "acme-help").await.unwrap();
             let content = rebuilt
                 .revisions
                 .get("agent", "acme-help", revisions[0].revision)

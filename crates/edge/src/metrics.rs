@@ -443,7 +443,9 @@ pub(crate) mod tests {
             assert_eq!(metrics.get(expected), Some(&1), "{expected} in {metrics:?}");
         }
         assert_eq!(
-            metrics.get("edge_mcp_tools_cache_total{agent=acme-help,result=hit,server=docs,tenant=acme}"),
+            metrics.get(
+                "edge_mcp_tools_cache_total{agent=acme-help,result=hit,server=docs,tenant=acme}"
+            ),
             Some(&2),
             "a counter accumulates"
         );
