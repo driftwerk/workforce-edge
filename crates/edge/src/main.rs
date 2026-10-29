@@ -10,6 +10,10 @@ use workforce_edge::config::EdgeConfig;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls is built with both ring and aws-lc-rs here, so it cannot pick a
+    // default provider itself; libraries that call plain
+    // `ClientConfig::builder()` would panic on their first TLS connection.
+    workforce_common::tls::install_default_crypto_provider();
     color_eyre::install()?;
     // Operator helper: print an argon2 hash for [admin] password_hash and exit.
     if std::env::args().any(|a| a == "--hash-password") {
