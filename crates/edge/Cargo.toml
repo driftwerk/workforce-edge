@@ -50,7 +50,7 @@ refinery = { workspace = true }
 async-trait = { workspace = true }
 axum = { version = "0.8", features = ["ws", "multipart"] }
 # Training-file text extraction (uploads). Same versions the hub loaders use.
-pdf-extract = "0.10"
+pdf-extract = "0.12"
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
 quick-xml = "0.41"
 tower-http = { version = "0.6", features = ["cors"] }
@@ -90,6 +90,9 @@ tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.28"
 # Shared embedded-Postgres harness for the `edge_analytics` DB tests.
 workforce-postgres = { workspace = true, features = ["test-support"] }
+# Builds a TLS client config the way libraries that leave the provider to
+# rustls do, for the crypto-provider test.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [build-dependencies]
 workforce-build-support = { workspace = true }
