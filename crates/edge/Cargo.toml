@@ -31,10 +31,10 @@ vellev-core = "0.1"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 argon2 = { workspace = true }
-getrandom = "0.2"
+getrandom = "0.4"
 # PKCE (SHA-256 challenge) + base64url for the OIDC Authorization Code flow.
-sha2 = "0.10"
-base64 = "0.22"
+sha2 = "0.11"
+base64 = "0.23"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tokio-postgres = { workspace = true }
@@ -52,10 +52,10 @@ axum = { version = "0.8", features = ["ws", "multipart"] }
 # Training-file text extraction (uploads). Same versions the hub loaders use.
 pdf-extract = "0.12"
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
-quick-xml = "0.41"
-tower-http = { version = "0.6", features = ["cors"] }
+quick-xml = "0.42"
+tower-http = { version = "0.7", features = ["cors"] }
 futures = { workspace = true }
-ipnetwork = "0.20"
+ipnetwork = "0.21"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
 eyre = { workspace = true }
@@ -66,14 +66,14 @@ tracing = { workspace = true }
 # The `edge_mcp_*` metrics and their Prometheus exposition at `/metrics`, the
 # same facade and exporter versions the core crates use.
 metrics = "0.24.6"
-metrics-exporter-prometheus = { version = "0.16", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 glob = "0.3"
 # Pure-Rust signing, as in core.
 jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 mime_guess = "2"
 
@@ -83,11 +83,11 @@ tempfile = "3"
 [dev-dependencies]
 wiremock = "0.6"
 # Captures emitted metrics in tests, as the core crates' metric tests do.
-metrics-util = { version = "0.19", default-features = false, features = ["debugging"] }
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 # Drives the router in-process (`ServiceExt::oneshot`) for the tenant tests.
 tower = { version = "0.5", features = ["util"] }
 # A websocket client against the served router, for the socket tests.
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.30"
 # Shared embedded-Postgres harness for the `edge_analytics` DB tests.
 workforce-postgres = { workspace = true, features = ["test-support"] }
 # Builds a TLS client config the way libraries that leave the provider to
